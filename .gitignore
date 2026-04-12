@@ -1,0 +1,29 @@
+# Build output
+Debug/
+Release/
+build/
+**/Debug/
+**/Release/
+
+# Object / output files
+*.o
+*.obj
+*.d
+*.su
+*.elf
+*.map
+*.list
+*.hex
+*.bin
+
+# CubeIDE / Eclipse user metadata
+.settings/
+.metadata/
+*.launch
+
+# VS Code
+.vscode/
+
+# OS junk
+.DS_Store
+Thumbs.db
