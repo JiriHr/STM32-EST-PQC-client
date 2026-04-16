@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <ctype.h>
 
 #include "psa/crypto.h"
 
@@ -101,6 +102,59 @@ static void print_http_headers(const uint8_t *buf, size_t header_len)
     printf("HTTP headers:\r\n%s", headers);
 }
 
+static void print_http_body_preview(const uint8_t *buf, size_t len)
+{
+    size_t preview_len;
+    size_t i;
+    int printable = 1;
+
+    if (buf == NULL || len == 0) {
+        printf("HTTP body is empty\r\n");
+        return;
+    }
+
+    preview_len = len;
+    if (preview_len > 256) {
+        preview_len = 256;
+    }
+
+    for (i = 0; i < preview_len; i++) {
+        if (!(isprint((unsigned char) buf[i]) ||
+              buf[i] == '\r' || buf[i] == '\n' || buf[i] == '\t')) {
+            printable = 0;
+            break;
+        }
+    }
+
+    printf("HTTP body length: %u bytes\r\n", (unsigned) len);
+
+    if (printable) {
+        printf("HTTP body preview:\r\n");
+        for (i = 0; i < preview_len; i++) {
+            putchar((char) buf[i]);
+        }
+        if (preview_len < len) {
+            printf("\r\n... (truncated)\r\n");
+        } else if (preview_len == 0 || buf[preview_len - 1] != '\n') {
+            printf("\r\n");
+        }
+    } else {
+        printf("HTTP body preview (hex, first %u bytes):\r\n", (unsigned) preview_len);
+        for (i = 0; i < preview_len; i++) {
+            printf("%02X ", buf[i]);
+            if (((i + 1) % 16) == 0) {
+                printf("\r\n");
+            }
+        }
+        if ((preview_len % 16) != 0) {
+            printf("\r\n");
+        }
+        if (preview_len < len) {
+            printf("... (truncated)\r\n");
+        }
+    }
+}
+
 static int ssl_write_all(mbedtls_ssl_context *ssl,
                          const uint8_t *buf,
                          size_t len)
@@ -134,6 +188,7 @@ static int est_https_request(const char *host,
                              const char *client_key_pem,
                              const char *method,
                              const char *content_type,
+                             const char *content_transfer_encoding,
                              const uint8_t *body,
                              size_t body_len,
                              uint8_t *out_body,
@@ -142,7 +197,7 @@ static int est_https_request(const char *host,
 {
     int ret;
     uint8_t rx_chunk[EST_RX_CHUNK_SIZE];
-    char req_headers[768];
+    char req_headers[896];
     size_t resp_len = 0;
     int header_body_off;
     int status_code;
@@ -314,27 +369,47 @@ static int est_https_request(const char *host,
     printf("Certificate verification OK\r\n");
 
     if (body != NULL && body_len > 0) {
+        if (content_transfer_encoding != NULL && content_transfer_encoding[0] != '\0') {
+            ret = snprintf(req_headers, sizeof(req_headers),
+                           "%s %s HTTP/1.1\r\n"
+                           "Host: %s:%u\r\n"
+                           "Connection: close\r\n"
+                           "Content-Type: %s\r\n"
+                           "Content-Transfer-Encoding: %s\r\n"
+                           "Content-Length: %u\r\n"
+                           "\r\n",
+                           method,
+                           path,
+                           host,
+                           (unsigned) port,
+                           (content_type != NULL) ? content_type : "application/octet-stream",
+                           content_transfer_encoding,
+                           (unsigned) body_len);
+        } else {
+            ret = snprintf(req_headers, sizeof(req_headers),
+                           "%s %s HTTP/1.1\r\n"
+                           "Host: %s:%u\r\n"
+                           "Connection: close\r\n"
+                           "Content-Type: %s\r\n"
+                           "Content-Length: %u\r\n"
+                           "\r\n",
+                           method,
+                           path,
+                           host,
+                           (unsigned) port,
+                           (content_type != NULL) ? content_type : "application/octet-stream",
+                           (unsigned) body_len);
+        }
+    } else {
         ret = snprintf(req_headers, sizeof(req_headers),
                        "%s %s HTTP/1.1\r\n"
-                       "Host: %s\r\n"
+                       "Host: %s:%u\r\n"
                        "Connection: close\r\n"
-                       "Content-Type: %s\r\n"
-                       "Content-Length: %u\r\n"
                        "\r\n",
                        method,
                        path,
                        host,
-                       (content_type != NULL) ? content_type : "application/octet-stream",
-                       (unsigned) body_len);
-    } else {
-        ret = snprintf(req_headers, sizeof(req_headers),
-                       "%s %s HTTP/1.1\r\n"
-                       "Host: %s\r\n"
-                       "Connection: close\r\n"
-                       "\r\n",
-                       method,
-                       path,
-                       host);
+                       (unsigned) port);
     }
 
     if (ret < 0 || (size_t) ret >= sizeof(req_headers)) {
@@ -413,14 +488,15 @@ static int est_https_request(const char *host,
 
     print_http_headers(g_http_response_buf, (size_t) header_body_off);
 
-    if (status_code < 200 || status_code >= 300) {
-        printf("HTTP request failed with status %d\r\n", status_code);
-        ret = -1;
-        goto cleanup;
-    }
-
     {
         size_t body_bytes = resp_len - (size_t) header_body_off;
+
+        if (status_code < 200 || status_code >= 300) {
+            printf("HTTP request failed with status %d\r\n", status_code);
+            print_http_body_preview(&g_http_response_buf[header_body_off], body_bytes);
+            ret = -1;
+            goto cleanup;
+        }
 
         if (body_bytes > out_body_size) {
             printf("Output body buffer too small: need %u, have %u\r\n",
@@ -465,6 +541,7 @@ int est_client_get_cacerts(const char *host,
                              "GET",
                              NULL,
                              NULL,
+                             NULL,
                              0,
                              out_body,
                              out_body_size,
@@ -496,6 +573,7 @@ int est_client_simpleenroll(const char *host,
                              client_key_pem,
                              "POST",
                              "application/pkcs10",
+                             "base64",
                              csr_der,
                              csr_der_len,
                              out_body,

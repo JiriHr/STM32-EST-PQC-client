@@ -25,32 +25,39 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include <stdio.h>
+#include <stdint.h>
+#include <string.h>
+#include <ctype.h>
 
+#include "ca_cert.h"
+#include "est_client.h"
+#include "csr_data.h"
+#include "bootstrap_credentials.h"
+
+#include "mbedtls/base64.h"
+#include "mbedtls/x509_crt.h"
+#include "mbedtls/error.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-
-#include "psa/crypto.h"
-#include "mbedtls/pk.h"
-#include "mbedtls/x509_csr.h"
-#include "mbedtls/error.h"
-
-#include "../TLS/ca_cert.h"
-#include "../TLS/tls_client.h"
-#include "../TLS/tls_port.h"
-
-
-
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define EST_HOST                "localhost"
+#define EST_PORT                8443
 
+#define EST_CACERTS_PATH        "/api/dmsmanager/.well-known/est/est-ra/cacerts"
+#define EST_SIMPLEENROLL_PATH   "/api/dmsmanager/.well-known/est/est-ra/simpleenroll"
+
+#define CACERTS_BUF_SIZE        4096
+#define ENROLL_BUF_SIZE         8192
+#define DER_DECODE_BUF_SIZE     8192
+#define CERT_PEM_B64_BUF_SIZE   4096
+#define CERT_INFO_BUF_SIZE      2048
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,18 +70,272 @@
 COM_InitTypeDef BspCOMInit;
 
 /* USER CODE BEGIN PV */
-
+static uint8_t g_cacerts_buf[CACERTS_BUF_SIZE];
+static uint8_t g_enroll_buf[ENROLL_BUF_SIZE];
+static uint8_t g_der_buf[DER_DECODE_BUF_SIZE];
+static unsigned char g_cert_pem_b64_buf[CERT_PEM_B64_BUF_SIZE];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 void PeriphCommonClock_Config(void);
-/* USER CODE BEGIN PFP */
 
+/* USER CODE BEGIN PFP */
+static void dump_hex_preview(const char *label, const uint8_t *buf, size_t len, size_t max_len);
+static int compact_base64_body(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size, size_t *out_len);
+static int asn1_get_object_total_len(const uint8_t *buf, size_t buf_len, size_t *out_total_len);
+static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t *out_off, size_t *out_len);
+static void print_mbedtls_error(const char *label, int ret);
+static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_b64_len);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+static void dump_hex_preview(const char *label, const uint8_t *buf, size_t len, size_t max_len)
+{
+    size_t i;
+    size_t shown;
+
+    if (label == NULL) {
+        label = "buffer";
+    }
+
+    if (buf == NULL) {
+        printf("%s: (null)\r\n", label);
+        return;
+    }
+
+    shown = (len < max_len) ? len : max_len;
+
+    printf("%s (%u bytes, showing %u):\r\n",
+           label,
+           (unsigned) len,
+           (unsigned) shown);
+
+    for (i = 0; i < shown; i++) {
+        printf("%02X ", buf[i]);
+
+        if (((i + 1) % 16) == 0) {
+            printf("\r\n");
+        }
+    }
+
+    if ((shown % 16) != 0) {
+        printf("\r\n");
+    }
+}
+
+static void print_mbedtls_error(const char *label, int ret)
+{
+    char errbuf[128];
+
+    mbedtls_strerror(ret, errbuf, sizeof(errbuf));
+    printf("%s failed: ret=%d (-0x%04X) (%s)\r\n",
+           label,
+           ret,
+           (unsigned int) -ret,
+           errbuf);
+}
+
+static int compact_base64_body(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size, size_t *out_len)
+{
+    size_t i;
+    size_t j = 0;
+
+    if (in == NULL || out == NULL || out_len == NULL) {
+        return -1;
+    }
+
+    for (i = 0; i < in_len; i++) {
+        uint8_t c = in[i];
+
+        if (c == '\r' || c == '\n' || c == ' ' || c == '\t') {
+            continue;
+        }
+
+        if (j >= out_size) {
+            return -1;
+        }
+
+        out[j++] = c;
+    }
+
+    *out_len = j;
+    return 0;
+}
+
+static int asn1_get_object_total_len(const uint8_t *buf, size_t buf_len, size_t *out_total_len)
+{
+    size_t len_bytes;
+    size_t content_len = 0;
+    size_t i;
+
+    if (buf == NULL || out_total_len == NULL || buf_len < 2) {
+        return -1;
+    }
+
+    if (buf[0] != 0x30) {
+        return -1;
+    }
+
+    if ((buf[1] & 0x80U) == 0U) {
+        content_len = buf[1];
+        if (2U + content_len > buf_len) {
+            return -1;
+        }
+        *out_total_len = 2U + content_len;
+        return 0;
+    }
+
+    len_bytes = (size_t) (buf[1] & 0x7FU);
+    if (len_bytes == 0U || len_bytes > sizeof(size_t) || 2U + len_bytes > buf_len) {
+        return -1;
+    }
+
+    for (i = 0; i < len_bytes; i++) {
+        content_len = (content_len << 8) | buf[2U + i];
+    }
+
+    if (2U + len_bytes + content_len > buf_len) {
+        return -1;
+    }
+
+    *out_total_len = 2U + len_bytes + content_len;
+    return 0;
+}
+
+static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t *out_off, size_t *out_len)
+{
+    size_t off;
+
+    if (buf == NULL || out_off == NULL || out_len == NULL) {
+        return -1;
+    }
+
+    for (off = 0; off + 4 < buf_len; off++) {
+        size_t obj_len;
+        int ret;
+        mbedtls_x509_crt crt;
+
+        if (buf[off] != 0x30) {
+            continue;
+        }
+
+        ret = asn1_get_object_total_len(buf + off, buf_len - off, &obj_len);
+        if (ret != 0) {
+            continue;
+        }
+
+        mbedtls_x509_crt_init(&crt);
+        ret = mbedtls_x509_crt_parse_der(&crt, buf + off, obj_len);
+        if (ret == 0) {
+            *out_off = off;
+            *out_len = obj_len;
+            mbedtls_x509_crt_free(&crt);
+            return 0;
+        }
+        mbedtls_x509_crt_free(&crt);
+    }
+
+    return -1;
+}
+
+static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_b64_len)
+{
+    int ret;
+    size_t compact_len = 0;
+    size_t der_len = 0;
+    size_t cert_off = 0;
+    size_t cert_len = 0;
+    char info_buf[CERT_INFO_BUF_SIZE];
+    mbedtls_x509_crt crt;
+    size_t pem_b64_len = 0;
+    size_t i;
+
+    if (body_b64 == NULL || body_b64_len == 0) {
+        printf("No EST body to decode\r\n");
+        return -1;
+    }
+
+    ret = compact_base64_body(body_b64,
+                              body_b64_len,
+                              g_der_buf,
+                              sizeof(g_der_buf),
+                              &compact_len);
+    if (ret != 0) {
+        printf("Failed to compact base64 EST body\r\n");
+        return -1;
+    }
+
+    ret = mbedtls_base64_decode(g_der_buf,
+                                sizeof(g_der_buf),
+                                &der_len,
+                                g_der_buf,
+                                compact_len);
+    if (ret != 0) {
+        print_mbedtls_error("mbedtls_base64_decode(EST body)", ret);
+        return -1;
+    }
+
+    printf("Decoded EST PKCS#7/CMS length: %u bytes\r\n", (unsigned) der_len);
+    dump_hex_preview("decoded CMS body", g_der_buf, der_len, 96);
+
+    ret = find_first_der_certificate(g_der_buf, der_len, &cert_off, &cert_len);
+    if (ret != 0) {
+        printf("Failed to locate an embedded DER certificate inside CMS response\r\n");
+        return -1;
+    }
+
+    printf("Found DER certificate at offset %u, length %u bytes\r\n",
+           (unsigned) cert_off,
+           (unsigned) cert_len);
+
+    mbedtls_x509_crt_init(&crt);
+
+    ret = mbedtls_x509_crt_parse_der(&crt, g_der_buf + cert_off, cert_len);
+    if (ret != 0) {
+        print_mbedtls_error("mbedtls_x509_crt_parse_der(extracted cert)", ret);
+        mbedtls_x509_crt_free(&crt);
+        return -1;
+    }
+
+    memset(info_buf, 0, sizeof(info_buf));
+    mbedtls_x509_crt_info(info_buf, sizeof(info_buf) - 1, "", &crt);
+
+    printf("\r\n=== EXTRACTED CERTIFICATE INFO ===\r\n");
+    printf("%s", info_buf);
+
+    ret = mbedtls_base64_encode(g_cert_pem_b64_buf,
+                                sizeof(g_cert_pem_b64_buf),
+                                &pem_b64_len,
+                                crt.raw.p,
+                                crt.raw.len);
+    if (ret != 0) {
+        print_mbedtls_error("mbedtls_base64_encode(cert DER)", ret);
+        mbedtls_x509_crt_free(&crt);
+        return -1;
+    }
+
+    printf("\r\n=== EXTRACTED CERTIFICATE PEM ===\r\n");
+    printf("-----BEGIN CERTIFICATE-----\r\n");
+
+    for (i = 0; i < pem_b64_len; i++) {
+        putchar((char) g_cert_pem_b64_buf[i]);
+        if (((i + 1U) % 64U) == 0U) {
+            printf("\r\n");
+        }
+    }
+
+    if ((pem_b64_len % 64U) != 0U) {
+        printf("\r\n");
+    }
+
+    printf("-----END CERTIFICATE-----\r\n");
+
+    mbedtls_x509_crt_free(&crt);
+    return 0;
+}
 
 /* USER CODE END 0 */
 
@@ -84,6 +345,9 @@ void PeriphCommonClock_Config(void);
   */
 int main(void)
 {
+  size_t cacerts_len = 0;
+  size_t enroll_len = 0;
+  int ret;
 
   /* USER CODE BEGIN 1 */
 
@@ -113,6 +377,7 @@ int main(void)
   MX_RNG_Init();
   MX_AES1_Init();
   VCP_UART_Init();
+
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -123,6 +388,7 @@ int main(void)
   BspCOMInit.StopBits   = COM_STOPBITS_1;
   BspCOMInit.Parity     = COM_PARITY_NONE;
   BspCOMInit.HwFlowCtl  = COM_HWCONTROL_NONE;
+
   if (BSP_COM_Init(COM1, &BspCOMInit) != BSP_ERROR_NONE)
   {
     Error_Handler();
@@ -131,18 +397,59 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
-  printf("Starting TLS test...\r\n");
+  printf("Starting EST test...\r\n");
 
-  /* Run TLS test */
-  tls_client_test_https_get("localhost", 4433, "/", test_ca_pem);
+  printf("\r\n=== STEP 1: GET cacerts ===\r\n");
+  ret = est_client_get_cacerts(
+      EST_HOST,
+      EST_PORT,
+      EST_CACERTS_PATH,
+      test_ca_pem,
+      g_cacerts_buf,
+      sizeof(g_cacerts_buf),
+      &cacerts_len);
 
-  printf("TLS test finished\r\n");
+  if (ret != 0) {
+      printf("est_client_get_cacerts failed: %d\r\n", ret);
+  } else {
+      printf("est_client_get_cacerts OK, body length = %u bytes\r\n",
+             (unsigned) cacerts_len);
+      dump_hex_preview("cacerts body", g_cacerts_buf, cacerts_len, 128);
+  }
+
+  printf("\r\n=== STEP 2: POST simpleenroll ===\r\n");
+  ret = est_client_simpleenroll(
+      EST_HOST,
+      EST_PORT,
+      EST_SIMPLEENROLL_PATH,
+      test_ca_pem,
+      bootstrap_cert_pem,
+      bootstrap_key_pem,
+      device_01_csr_b64,
+      device_01_csr_b64_len,
+      g_enroll_buf,
+      sizeof(g_enroll_buf),
+      &enroll_len);
+
+  if (ret != 0) {
+      printf("est_client_simpleenroll failed: %d\r\n", ret);
+  } else {
+      printf("est_client_simpleenroll OK, PKCS#7 length = %u bytes\r\n",
+             (unsigned) enroll_len);
+      dump_hex_preview("simpleenroll body", g_enroll_buf, enroll_len, 128);
+
+      ret = print_certificate_from_est_body(g_enroll_buf, enroll_len);
+      if (ret != 0) {
+          printf("Failed to extract certificate from EST response: %d\r\n", ret);
+      }
+  }
+
+  printf("\r\nEST test finished\r\n");
 
   while (1)
-  	  {
-
+  {
     /* USER CODE BEGIN 3 */
-  	  }
+  }
   /* USER CODE END 3 */
 }
 
@@ -162,8 +469,8 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI
-                              |RCC_OSCILLATORTYPE_MSI;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48 | RCC_OSCILLATORTYPE_HSI
+                                   | RCC_OSCILLATORTYPE_MSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.MSIState = RCC_MSI_ON;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
@@ -177,6 +484,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
   {
     Error_Handler();
@@ -184,9 +492,9 @@ void SystemClock_Config(void)
 
   /** Configure the SYSCLKSource, HCLK, PCLK1 and PCLK2 clocks dividers
   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK4|RCC_CLOCKTYPE_HCLK2
-                              |RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
-                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK4 | RCC_CLOCKTYPE_HCLK2
+                              | RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                              | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
@@ -224,16 +532,16 @@ void PeriphCommonClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-  int _write(int file, char *ptr, int len)
-  {
-  	(void)file;
-  	int DataIdx;
-  	for (DataIdx = 0; DataIdx < len; DataIdx++)
-  	{
-  		ITM_SendChar(*ptr++);
-  	}
-  	return len;
-  }
+int _write(int file, char *ptr, int len)
+{
+    (void) file;
+
+    for (int i = 0; i < len; i++) {
+        ITM_SendChar(*ptr++);
+    }
+
+    return len;
+}
 /* USER CODE END 4 */
 
 /**
@@ -243,10 +551,13 @@ void PeriphCommonClock_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
+  while (1)
+  {
+  }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
 /**
   * @brief  Reports the name of the source file and the source line number
@@ -258,8 +569,7 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  printf("Wrong parameters value: file %s on line %lu\r\n", file, (unsigned long) line);
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
