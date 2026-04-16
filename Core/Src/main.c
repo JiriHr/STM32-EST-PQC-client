@@ -39,9 +39,9 @@
 #include "mbedtls/x509_csr.h"
 #include "mbedtls/error.h"
 
-#include "tls_client.h"
-#include "tls_port.h"
-#include "ca_cert.h"
+#include "../TLS/ca_cert.h"
+#include "../TLS/tls_client.h"
+#include "../TLS/tls_port.h"
 
 
 
