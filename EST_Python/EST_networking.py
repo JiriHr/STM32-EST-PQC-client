@@ -2,7 +2,7 @@ import serial
 import socket
 import time
 
-SERIAL_PORT = "COM3"
+SERIAL_PORT = "/dev/ttyACM0"
 BAUDRATE = 115200
 
 ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
@@ -10,14 +10,14 @@ ser = serial.Serial(SERIAL_PORT, BAUDRATE, timeout=0.1)
 sock = None
 connected = False
 
-print("Proxy started")
+print(f"Proxy started on {SERIAL_PORT} @ {BAUDRATE}")
 
 def close_socket():
     global sock, connected
     if sock is not None:
         try:
             sock.close()
-        except:
+        except Exception:
             pass
     sock = None
     connected = False
@@ -30,8 +30,8 @@ while True:
             print("UART CMD RAW:", repr(line))
 
             try:
-                cmd = line.decode(errors="ignore").strip()
-            except:
+                cmd = line.decode("utf-8", errors="ignore").strip()
+            except Exception:
                 cmd = ""
 
             print("UART CMD:", repr(cmd))
@@ -40,27 +40,34 @@ while True:
                 parts = cmd.split()
                 if len(parts) == 3:
                     host = parts[1]
-                    port = int(parts[2])
+
+                    try:
+                        port = int(parts[2])
+                    except ValueError:
+                        ser.write(b"ERR\n")
+                        continue
 
                     try:
                         sock = socket.create_connection((host, port), timeout=5)
                         sock.setblocking(False)
                         connected = True
                         ser.write(b"OK\n")
+                        ser.flush()
                         print(f"Connected to {host}:{port}")
                     except Exception as e:
                         ser.write(b"ERR\n")
+                        ser.flush()
                         print("Connect failed:", e)
                         close_socket()
                 else:
                     ser.write(b"ERR\n")
+                    ser.flush()
             else:
                 print("Ignoring data before CONNECT")
 
         time.sleep(0.01)
         continue
 
-    # Raw tunnel mode after CONNECT
     data = ser.read(1024)
     if data:
         try:
@@ -76,8 +83,6 @@ while True:
             net_data = sock.recv(1024)
             if net_data:
                 print(f"NET -> UART: {len(net_data)} bytes")
-
-                # 2-byte big-endian length prefix
                 hdr = len(net_data).to_bytes(2, "big")
                 ser.write(hdr)
                 ser.write(net_data)
@@ -90,3 +95,5 @@ while True:
         except Exception as e:
             print("Recv failed:", e)
             close_socket()
+
+    time.sleep(0.01)

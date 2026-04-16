@@ -15,6 +15,7 @@ build/
 *.list
 *.hex
 *.bin
+*.txt
 
 # CubeIDE / Eclipse user metadata
 .settings/

@@ -224,6 +224,11 @@ int tls_client_test_https_get(const char *host,
             continue;
         }
 
+        if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            printf("\r\nPeer closed the TLS connection cleanly\r\n");
+            break;
+        }
+
         if (ret == 0) {
             printf("\r\nConnection closed by peer\r\n");
             break;

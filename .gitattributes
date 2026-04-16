@@ -1,22 +1,48 @@
+# Default: let Git detect text files, normalize to LF in repo
 * text=auto
 
-# Keep source files as LF in the repository
-*.c   text eol=lf
-*.h   text eol=lf
-*.s   text eol=lf
-*.ld  text eol=lf
-*.txt text eol=lf
-*.md  text eol=lf
-*.cmake text eol=lf
+# Project/source files: always treat as text with LF
+*.c          text eol=lf
+*.h          text eol=lf
+*.s          text eol=lf
+*.ld         text eol=lf
+*.py         text eol=lf
+*.txt        text eol=lf
+*.md         text eol=lf
+*.cmake      text eol=lf
+*.gitignore  text eol=lf
+*.gitattributes text eol=lf
+*.project    text eol=lf
+*.cproject   text eol=lf
 
-# Windows scripts can stay CRLF if you have any
-*.bat text eol=crlf
-*.cmd text eol=crlf
+# Shell / config files often need LF too
+*.sh         text eol=lf
+*.yml        text eol=lf
+*.yaml       text eol=lf
+*.json       text eol=lf
+*.xml        text eol=lf
+
+# Windows scripts
+*.bat        text eol=crlf
+*.cmd        text eol=crlf
+*.ps1        text eol=crlf
 
 # Binary files
-*.png binary
-*.jpg binary
-*.jpeg binary
-*.bin binary
-*.elf binary
-*.hex binary
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.bmp        binary
+*.ico        binary
+*.pdf        binary
+*.zip        binary
+*.7z         binary
+*.tar        binary
+*.gz         binary
+*.bin        binary
+*.elf        binary
+*.o          binary
+*.a          binary
+*.so         binary
+*.dll        binary
+*.exe        binary
