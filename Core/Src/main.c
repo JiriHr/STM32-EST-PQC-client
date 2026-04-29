@@ -34,10 +34,14 @@
 #include "est_client.h"
 #include "csr_data.h"
 #include "bootstrap_credentials.h"
+#include "csr_gen.h"
 
 #include "mbedtls/base64.h"
 #include "mbedtls/x509_crt.h"
 #include "mbedtls/error.h"
+
+#include "../Middlewares/PQC/ml-dsa-44/m4fstack/ml-dsa-44-api.h"
+#include "../Middlewares/PQC/common/randombytes_stm32.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -56,8 +60,11 @@
 #define CACERTS_BUF_SIZE        4096
 #define ENROLL_BUF_SIZE         8192
 #define DER_DECODE_BUF_SIZE     8192
-#define CERT_PEM_B64_BUF_SIZE   4096
+#define CERT_PEM_B64_BUF_SIZE   6144
 #define CERT_INFO_BUF_SIZE      2048
+#define CSR_CRI_BUF_SIZE        2048
+#define CSR_DER_BUF_SIZE        4096
+#define CSR_B64_BUF_SIZE        6144
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,6 +81,12 @@ static uint8_t g_cacerts_buf[CACERTS_BUF_SIZE];
 static uint8_t g_enroll_buf[ENROLL_BUF_SIZE];
 static uint8_t g_der_buf[DER_DECODE_BUF_SIZE];
 static unsigned char g_cert_pem_b64_buf[CERT_PEM_B64_BUF_SIZE];
+static uint8_t g_csr_cri[CSR_CRI_BUF_SIZE];
+static uint8_t g_csr_der[CSR_DER_BUF_SIZE];
+static uint8_t g_csr_b64[CSR_B64_BUF_SIZE];
+static uint8_t g_mldsa_pk[CRYPTO_PUBLICKEYBYTES];
+static uint8_t g_mldsa_sk[CRYPTO_SECRETKEYBYTES];
+static uint8_t g_mldsa_sig[CRYPTO_BYTES];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -84,8 +97,11 @@ void PeriphCommonClock_Config(void);
 static void dump_hex_preview(const char *label, const uint8_t *buf, size_t len, size_t max_len);
 static int compact_base64_body(const uint8_t *in, size_t in_len, uint8_t *out, size_t out_size, size_t *out_len);
 static int asn1_get_object_total_len(const uint8_t *buf, size_t buf_len, size_t *out_total_len);
+static int asn1_get_tlv(const uint8_t *buf, size_t buf_len, uint8_t *out_tag, size_t *out_hdr_len, size_t *out_content_len);
+static int is_mldsa44_certificate_like(const uint8_t *buf, size_t buf_len);
 static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t *out_off, size_t *out_len);
 static void print_mbedtls_error(const char *label, int ret);
+static int print_raw_certificate_pem(const uint8_t *cert_der, size_t cert_der_len);
 static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_b64_len);
 /* USER CODE END PFP */
 
@@ -205,6 +221,107 @@ static int asn1_get_object_total_len(const uint8_t *buf, size_t buf_len, size_t 
     return 0;
 }
 
+static int asn1_get_tlv(const uint8_t *buf, size_t buf_len, uint8_t *out_tag, size_t *out_hdr_len, size_t *out_content_len)
+{
+    size_t len_bytes;
+    size_t content_len = 0;
+    size_t i;
+
+    if (buf == NULL || out_tag == NULL || out_hdr_len == NULL || out_content_len == NULL || buf_len < 2U) {
+        return -1;
+    }
+
+    *out_tag = buf[0];
+
+    if ((buf[1] & 0x80U) == 0U) {
+        *out_hdr_len = 2U;
+        *out_content_len = buf[1];
+        return (2U + *out_content_len <= buf_len) ? 0 : -1;
+    }
+
+    len_bytes = (size_t) (buf[1] & 0x7FU);
+    if (len_bytes == 0U || len_bytes > sizeof(size_t) || 2U + len_bytes > buf_len) {
+        return -1;
+    }
+
+    for (i = 0; i < len_bytes; i++) {
+        content_len = (content_len << 8) | buf[2U + i];
+    }
+
+    *out_hdr_len = 2U + len_bytes;
+    *out_content_len = content_len;
+    return (*out_hdr_len + content_len <= buf_len) ? 0 : -1;
+}
+
+static int der_contains_mldsa44_oid(const uint8_t *buf, size_t buf_len)
+{
+    static const uint8_t oid_tlv[] = {
+        0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x03, 0x11
+    };
+    size_t i;
+
+    if (buf == NULL || buf_len < sizeof(oid_tlv)) {
+        return 0;
+    }
+
+    for (i = 0; i + sizeof(oid_tlv) <= buf_len; i++) {
+        if (memcmp(buf + i, oid_tlv, sizeof(oid_tlv)) == 0) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static int is_mldsa44_certificate_like(const uint8_t *buf, size_t buf_len)
+{
+    uint8_t tag;
+    size_t hdr_len;
+    size_t content_len;
+    size_t total_len;
+    size_t pos;
+    size_t end;
+    size_t child_len;
+    size_t tbs_off;
+    size_t alg_off;
+    size_t sig_off;
+
+    if (buf == NULL || asn1_get_object_total_len(buf, buf_len, &total_len) != 0 || total_len != buf_len) {
+        return 0;
+    }
+
+    if (asn1_get_tlv(buf, buf_len, &tag, &hdr_len, &content_len) != 0 || tag != 0x30U) {
+        return 0;
+    }
+
+    pos = hdr_len;
+    end = hdr_len + content_len;
+
+    tbs_off = pos;
+    if (asn1_get_object_total_len(buf + pos, end - pos, &child_len) != 0) {
+        return 0;
+    }
+    pos += child_len;
+
+    alg_off = pos;
+    if (asn1_get_object_total_len(buf + pos, end - pos, &child_len) != 0) {
+        return 0;
+    }
+    pos += child_len;
+
+    sig_off = pos;
+    if (asn1_get_tlv(buf + pos, end - pos, &tag, &hdr_len, &content_len) != 0) {
+        return 0;
+    }
+    child_len = hdr_len + content_len;
+    if (pos + child_len != end || tag != 0x03U) {
+        return 0;
+    }
+
+    return der_contains_mldsa44_oid(buf + tbs_off, alg_off - tbs_off) &&
+           der_contains_mldsa44_oid(buf + alg_off, sig_off - alg_off);
+}
+
 static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t *out_off, size_t *out_len)
 {
     size_t off;
@@ -227,6 +344,12 @@ static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t
             continue;
         }
 
+        if (is_mldsa44_certificate_like(buf + off, obj_len)) {
+            *out_off = off;
+            *out_len = obj_len;
+            return 0;
+        }
+
         mbedtls_x509_crt_init(&crt);
         ret = mbedtls_x509_crt_parse_der(&crt, buf + off, obj_len);
         if (ret == 0) {
@@ -241,6 +364,40 @@ static int find_first_der_certificate(const uint8_t *buf, size_t buf_len, size_t
     return -1;
 }
 
+static int print_raw_certificate_pem(const uint8_t *cert_der, size_t cert_der_len)
+{
+    int ret;
+    size_t pem_b64_len = 0;
+    size_t i;
+
+    ret = mbedtls_base64_encode(g_cert_pem_b64_buf,
+                                sizeof(g_cert_pem_b64_buf),
+                                &pem_b64_len,
+                                cert_der,
+                                cert_der_len);
+    if (ret != 0) {
+        print_mbedtls_error("mbedtls_base64_encode(cert DER)", ret);
+        return -1;
+    }
+
+    printf("\r\n=== EXTRACTED CERTIFICATE PEM ===\r\n");
+    printf("-----BEGIN CERTIFICATE-----\r\n");
+
+    for (i = 0; i < pem_b64_len; i++) {
+        putchar((char) g_cert_pem_b64_buf[i]);
+        if (((i + 1U) % 64U) == 0U) {
+            printf("\r\n");
+        }
+    }
+
+    if ((pem_b64_len % 64U) != 0U) {
+        printf("\r\n");
+    }
+
+    printf("-----END CERTIFICATE-----\r\n");
+    return 0;
+}
+
 static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_b64_len)
 {
     int ret;
@@ -250,8 +407,6 @@ static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_
     size_t cert_len = 0;
     char info_buf[CERT_INFO_BUF_SIZE];
     mbedtls_x509_crt crt;
-    size_t pem_b64_len = 0;
-    size_t i;
 
     if (body_b64 == NULL || body_b64_len == 0) {
         printf("No EST body to decode\r\n");
@@ -295,6 +450,16 @@ static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_
 
     ret = mbedtls_x509_crt_parse_der(&crt, g_der_buf + cert_off, cert_len);
     if (ret != 0) {
+        if (is_mldsa44_certificate_like(g_der_buf + cert_off, cert_len)) {
+            printf("\r\n=== EXTRACTED CERTIFICATE INFO ===\r\n");
+            printf("certificate type  : X.509 with ML-DSA-44 algorithm identifiers\r\n");
+            printf("certificate length: %u bytes\r\n", (unsigned) cert_len);
+            printf("note              : mbedTLS does not parse ML-DSA X.509 OIDs in this build\r\n");
+            ret = print_raw_certificate_pem(g_der_buf + cert_off, cert_len);
+            mbedtls_x509_crt_free(&crt);
+            return ret;
+        }
+
         print_mbedtls_error("mbedtls_x509_crt_parse_der(extracted cert)", ret);
         mbedtls_x509_crt_free(&crt);
         return -1;
@@ -306,35 +471,10 @@ static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_
     printf("\r\n=== EXTRACTED CERTIFICATE INFO ===\r\n");
     printf("%s", info_buf);
 
-    ret = mbedtls_base64_encode(g_cert_pem_b64_buf,
-                                sizeof(g_cert_pem_b64_buf),
-                                &pem_b64_len,
-                                crt.raw.p,
-                                crt.raw.len);
-    if (ret != 0) {
-        print_mbedtls_error("mbedtls_base64_encode(cert DER)", ret);
-        mbedtls_x509_crt_free(&crt);
-        return -1;
-    }
-
-    printf("\r\n=== EXTRACTED CERTIFICATE PEM ===\r\n");
-    printf("-----BEGIN CERTIFICATE-----\r\n");
-
-    for (i = 0; i < pem_b64_len; i++) {
-        putchar((char) g_cert_pem_b64_buf[i]);
-        if (((i + 1U) % 64U) == 0U) {
-            printf("\r\n");
-        }
-    }
-
-    if ((pem_b64_len % 64U) != 0U) {
-        printf("\r\n");
-    }
-
-    printf("-----END CERTIFICATE-----\r\n");
+    ret = print_raw_certificate_pem(crt.raw.p, crt.raw.len);
 
     mbedtls_x509_crt_free(&crt);
-    return 0;
+    return ret;
 }
 
 /* USER CODE END 0 */
@@ -373,6 +513,7 @@ int main(void)
   /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
+  psa_crypto_init();
   MX_GPIO_Init();
   MX_RNG_Init();
   MX_AES1_Init();
@@ -394,58 +535,153 @@ int main(void)
     Error_Handler();
   }
 
+  if (randombytes_stm32_init(&hrng, &hcryp1) != 0) {
+      printf("randombytes_stm32_init failed\r\n");
+      while (1);
+  }
+
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
   printf("Starting EST test...\r\n");
 
-  printf("\r\n=== STEP 1: GET cacerts ===\r\n");
-  ret = est_client_get_cacerts(
-      EST_HOST,
-      EST_PORT,
-      EST_CACERTS_PATH,
-      test_ca_pem,
-      g_cacerts_buf,
-      sizeof(g_cacerts_buf),
-      &cacerts_len);
+   /* ===================================================== */
+   /* STEP 1: GET CACERTS */
+   /* ===================================================== */
 
-  if (ret != 0) {
-      printf("est_client_get_cacerts failed: %d\r\n", ret);
-  } else {
-      printf("est_client_get_cacerts OK, body length = %u bytes\r\n",
-             (unsigned) cacerts_len);
-      dump_hex_preview("cacerts body", g_cacerts_buf, cacerts_len, 128);
-  }
+   printf("\r\n=== STEP 1: GET cacerts ===\r\n");
 
-  printf("\r\n=== STEP 2: POST simpleenroll ===\r\n");
-  ret = est_client_simpleenroll(
-      EST_HOST,
-      EST_PORT,
-      EST_SIMPLEENROLL_PATH,
-      test_ca_pem,
-      bootstrap_cert_pem,
-      bootstrap_key_pem,
-      device_01_csr_b64,
-      device_01_csr_b64_len,
-      g_enroll_buf,
-      sizeof(g_enroll_buf),
-      &enroll_len);
+   ret = est_client_get_cacerts(
+       EST_HOST,
+       EST_PORT,
+       EST_CACERTS_PATH,
+       test_ca_pem,
+       g_cacerts_buf,
+       sizeof(g_cacerts_buf),
+       &cacerts_len);
 
-  if (ret != 0) {
-      printf("est_client_simpleenroll failed: %d\r\n", ret);
-  } else {
-      printf("est_client_simpleenroll OK, PKCS#7 length = %u bytes\r\n",
-             (unsigned) enroll_len);
-      dump_hex_preview("simpleenroll body", g_enroll_buf, enroll_len, 128);
+   if (ret != 0) {
+       printf("est_client_get_cacerts failed: %d\r\n", ret);
+   } else {
+       printf("est_client_get_cacerts OK, body length = %u bytes\r\n",
+              (unsigned)cacerts_len);
+       dump_hex_preview("cacerts body", g_cacerts_buf, cacerts_len, 128);
+   }
 
-      ret = print_certificate_from_est_body(g_enroll_buf, enroll_len);
-      if (ret != 0) {
-          printf("Failed to extract certificate from EST response: %d\r\n", ret);
-      }
-  }
+   /* ===================================================== */
+   /* STEP 2: GENERATE CSR (CUSTOM, NO MBEDTLS) */
+   /* ===================================================== */
 
-  printf("\r\nEST test finished\r\n");
+   printf("\r\n=== STEP 2: GENERATE CSR ===\r\n");
 
+   size_t csr_cri_len = 0;
+   size_t csr_der_len = 0;
+   size_t csr_b64_len = 0;
+   size_t signature_len = 0;
+
+   ret = crypto_sign_keypair(g_mldsa_pk, g_mldsa_sk);
+   if (ret != 0) {
+       printf("ML-DSA keypair failed: %d\r\n", ret);
+       while (1);
+   }
+
+   ret = csr_build_certification_request_info(
+       "device-01",
+       g_mldsa_pk, sizeof(g_mldsa_pk),
+       g_csr_cri, sizeof(g_csr_cri),
+       &csr_cri_len);
+
+   if (ret != 0) {
+       printf("CSR CRI generation failed\r\n");
+       while (1);
+   }
+
+   ret = crypto_sign_signature(
+       g_mldsa_sig, &signature_len,
+       g_csr_cri, csr_cri_len,
+       g_mldsa_sk);
+
+   if (ret != 0) {
+       printf("ML-DSA signing failed: %d\r\n", ret);
+       while (1);
+   }
+
+   printf("ML-DSA signature ready (%u bytes)\r\n", (unsigned)signature_len);
+
+   ret = crypto_sign_verify(
+       g_mldsa_sig, signature_len,
+       g_csr_cri, csr_cri_len,
+       g_mldsa_pk);
+
+   if (ret != 0) {
+       printf("ML-DSA local verification failed: %d\r\n", ret);
+       while (1);
+   }
+
+   printf("ML-DSA local verification OK\r\n");
+
+   ret = csr_assemble(
+       g_csr_cri, csr_cri_len,
+       g_mldsa_sig, signature_len,
+       g_csr_der, sizeof(g_csr_der),
+       &csr_der_len);
+
+   if (ret != 0) {
+       printf("CSR assembly failed\r\n");
+       while (1);
+   }
+
+   printf("CSR DER ready (%u bytes)\r\n", (unsigned)csr_der_len);
+   dump_hex_preview("CSR DER", g_csr_der, csr_der_len, 128);
+
+   /* Base64 encode CSR */
+   ret = mbedtls_base64_encode(
+       g_csr_b64,
+       sizeof(g_csr_b64),
+       &csr_b64_len,
+       g_csr_der,
+       csr_der_len);
+
+   if (ret != 0) {
+       printf("Base64 encoding failed: %d\r\n", ret);
+       while (1);
+   }
+
+   printf("CSR base64 ready (%u bytes)\r\n", (unsigned)csr_b64_len);
+
+   /* ===================================================== */
+   /* STEP 3: SIMPLE ENROLL */
+   /* ===================================================== */
+
+   printf("\r\n=== STEP 3: POST simpleenroll ===\r\n");
+
+   ret = est_client_simpleenroll(
+       EST_HOST,
+       EST_PORT,
+       EST_SIMPLEENROLL_PATH,
+       test_ca_pem,
+       bootstrap_cert_pem,
+       bootstrap_key_pem,
+       g_csr_b64,
+       csr_b64_len,
+       g_enroll_buf,
+       sizeof(g_enroll_buf),
+       &enroll_len);
+
+   if (ret != 0) {
+       printf("est_client_simpleenroll failed: %d\r\n", ret);
+   } else {
+       printf("est_client_simpleenroll OK, PKCS#7 length = %u bytes\r\n",
+              (unsigned)enroll_len);
+       dump_hex_preview("simpleenroll body", g_enroll_buf, enroll_len, 128);
+
+       ret = print_certificate_from_est_body(g_enroll_buf, enroll_len);
+       if (ret != 0) {
+           printf("Failed to extract certificate from EST response: %d\r\n", ret);
+       }
+   }
+
+   printf("\r\nEST test finished\r\n");
   while (1)
   {
     /* USER CODE BEGIN 3 */

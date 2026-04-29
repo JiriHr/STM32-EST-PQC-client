@@ -124,7 +124,13 @@ int tls_port_recv(void *ctx, unsigned char *buf, size_t len)
 
         payload_len = ((uint16_t) hdr[0] << 8) | hdr[1];
 
-        if (payload_len == 0 || payload_len > TLS_FRAME_MAX) {
+        if (payload_len == 0) {
+            printf("tls_port_recv: EOF frame\r\n");
+            sock->connected = 0;
+            return 0;
+        }
+
+        if (payload_len > TLS_FRAME_MAX) {
             printf("tls_port_recv: bad frame length %u\r\n", (unsigned) payload_len);
             return MBEDTLS_ERR_NET_RECV_FAILED;
         }
