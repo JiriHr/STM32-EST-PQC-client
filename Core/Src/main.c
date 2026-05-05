@@ -35,6 +35,7 @@
 #include "csr_data.h"
 #include "bootstrap_credentials.h"
 #include "csr_gen.h"
+#include "cms_pqc.h"
 
 #include "mbedtls/base64.h"
 #include "mbedtls/x509_crt.h"
@@ -679,6 +680,17 @@ int main(void)
        if (ret != 0) {
            printf("Failed to extract certificate from EST response: %d\r\n", ret);
        }
+   }
+
+   /* ===================================================== */
+   /* STEP 4: CMS PQC SELF-TESTS */
+   /* ===================================================== */
+
+   printf("\r\n=== STEP 4: CMS PQC self-tests ===\r\n");
+
+   ret = cms_pqc_self_test();
+   if (ret != 0) {
+       printf("CMS PQC self-tests failed: %d\r\n", ret);
    }
 
    printf("\r\nEST test finished\r\n");

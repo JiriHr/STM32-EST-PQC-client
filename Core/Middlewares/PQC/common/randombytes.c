@@ -10,13 +10,17 @@
 
 extern RNG_HandleTypeDef hrng;
 
+static RNG_HandleTypeDef *g_hrng = NULL;
+
 int randombytes(uint8_t *out, size_t outlen)
 {
+    RNG_HandleTypeDef *rng = (g_hrng != NULL) ? g_hrng : &hrng;
+
     if (out == NULL && outlen != 0) return -1;
 
     while (outlen >= 4) {
         uint32_t r;
-        if (HAL_RNG_GenerateRandomNumber(&hrng, &r) != HAL_OK) return -1;
+        if (HAL_RNG_GenerateRandomNumber(rng, &r) != HAL_OK) return -1;
         out[0] = (uint8_t)(r);
         out[1] = (uint8_t)(r >> 8);
         out[2] = (uint8_t)(r >> 16);
@@ -27,10 +31,23 @@ int randombytes(uint8_t *out, size_t outlen)
 
     if (outlen > 0) {
         uint32_t r;
-        if (HAL_RNG_GenerateRandomNumber(&hrng, &r) != HAL_OK) return -1;
+        if (HAL_RNG_GenerateRandomNumber(rng, &r) != HAL_OK) return -1;
         for (size_t i = 0; i < outlen; i++)
             out[i] = (uint8_t)(r >> (8 * i));
     }
+    return 0;
+}
+
+int randombytes_stm32_init(RNG_HandleTypeDef *hrng_handle,
+                           CRYP_HandleTypeDef *hcryp_handle)
+{
+    (void)hcryp_handle;
+
+    if (hrng_handle == NULL) {
+        return -1;
+    }
+
+    g_hrng = hrng_handle;
     return 0;
 }
 
