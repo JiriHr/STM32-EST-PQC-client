@@ -1,0 +1,73 @@
+package helpers
+
+import (
+	"crypto/ecdsa"
+	"crypto/rsa"
+	"crypto/x509"
+
+	"github.com/lamassuiot/lamassuiot/core/v3/pkg/models"
+)
+
+func KeyStrengthMetadataFromCertificate(cert *x509.Certificate) models.KeyStrengthMetadata {
+	var keyType models.KeyType
+	var keyBits int
+	switch cert.PublicKeyAlgorithm {
+	case x509.RSA:
+		keyType = models.KeyType(x509.RSA)
+		keyBits = cert.PublicKey.(*rsa.PublicKey).N.BitLen()
+	case x509.ECDSA:
+		keyType = models.KeyType(x509.ECDSA)
+		keyBits = cert.PublicKey.(*ecdsa.PublicKey).Params().BitSize
+	case x509.PublicKeyAlgorithm(models.KeyTypeDilithium2):
+		keyType = models.KeyTypeDilithium2
+	case x509.PublicKeyAlgorithm(models.KeyTypeDilithium3):
+		keyType = models.KeyTypeDilithium3
+	case x509.PublicKeyAlgorithm(models.KeyTypeDilithium5):
+		keyType = models.KeyTypeDilithium5
+	case x509.PublicKeyAlgorithm(models.KeyTypeMLDSA44):
+		keyType = models.KeyTypeMLDSA44
+	case x509.PublicKeyAlgorithm(models.KeyTypeMLDSA65):
+		keyType = models.KeyTypeMLDSA65
+	case x509.PublicKeyAlgorithm(models.KeyTypeMLDSA87):
+		keyType = models.KeyTypeMLDSA87
+	}
+
+	return KeyStrengthBuilder(keyType, keyBits)
+
+}
+
+func KeyStrengthBuilder(keyType models.KeyType, keyBits int) models.KeyStrengthMetadata {
+	var keyStrength models.KeyStrength = models.KeyStrengthLow
+	switch keyType {
+	case models.KeyType(x509.RSA):
+		if keyBits < 2048 {
+			keyStrength = models.KeyStrengthLow
+		} else if keyBits >= 2048 && keyBits < 3072 {
+			keyStrength = models.KeyStrengthMedium
+		} else {
+			keyStrength = models.KeyStrengthHigh
+		}
+	case models.KeyType(x509.ECDSA):
+		if keyBits <= 128 {
+			keyStrength = models.KeyStrengthLow
+		} else if keyBits > 128 && keyBits < 256 {
+			keyStrength = models.KeyStrengthMedium
+		} else {
+			keyStrength = models.KeyStrengthHigh
+		}
+	case models.KeyTypeDilithium2:
+		keyStrength = models.KeyStrengthMedium
+	case models.KeyTypeDilithium3, models.KeyTypeDilithium5:
+		keyStrength = models.KeyStrengthHigh
+	case models.KeyTypeMLDSA44:
+		keyStrength = models.KeyStrengthMedium
+	case models.KeyTypeMLDSA65, models.KeyTypeMLDSA87:
+		keyStrength = models.KeyStrengthHigh
+	}
+
+	return models.KeyStrengthMetadata{
+		Type:     keyType,
+		Bits:     keyBits,
+		Strength: keyStrength,
+	}
+}
