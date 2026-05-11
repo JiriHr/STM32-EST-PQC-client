@@ -36,6 +36,7 @@
 #include "bootstrap_credentials.h"
 #include "csr_gen.h"
 #include "cms_pqc.h"
+#include "tls_port.h"
 
 #include "mbedtls/base64.h"
 #include "mbedtls/x509_crt.h"
@@ -52,17 +53,51 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define EST_HOST                "localhost"
-#define EST_PORT                8443
+#define EST_TARGET_ADHOC_RA                 1
+#define EST_TARGET_LAMASSU_PQC_MLDSA44      2
 
-#define EST_CACERTS_PATH        "/api/dmsmanager/.well-known/est/est-ra/cacerts"
-#define EST_SIMPLEENROLL_PATH   "/api/dmsmanager/.well-known/est/est-ra/simpleenroll"
+#ifndef EST_TARGET_PROFILE
+#define EST_TARGET_PROFILE                  EST_TARGET_ADHOC_RA
+#endif
 
-#define CACERTS_BUF_SIZE        4096
+#define EST_HOST                            "localhost"
+#define EST_PORT                            8443
+#define EST_BASE_PATH                       "/api/dmsmanager/.well-known/est/"
+#define EST_DEVICE_COMMON_NAME              "device-01"
+
+#if EST_TARGET_PROFILE == EST_TARGET_ADHOC_RA
+#define EST_PROFILE_NAME                    "ad-hoc-ra"
+#define EST_APS_ID                          "est-ra"
+#define EST_USE_TLS_CLIENT_CERT             1
+#define EST_USE_DYNAMIC_SERVER_CA           0
+#define EST_SERVER_CA_PEM                   test_ca_pem
+#elif EST_TARGET_PROFILE == EST_TARGET_LAMASSU_PQC_MLDSA44
+#define EST_PROFILE_NAME                    "lamassu-pqc-mldsa44"
+#define EST_APS_ID                          "mldsa44-est-dms"
+#define EST_USE_TLS_CLIENT_CERT             0
+#define EST_USE_DYNAMIC_SERVER_CA           1
+#define EST_SERVER_CA_PEM                   g_dynamic_server_ca_pem
+#else
+#error "Unsupported EST_TARGET_PROFILE"
+#endif
+
+#define EST_CACERTS_PATH                    EST_BASE_PATH EST_APS_ID "/cacerts"
+#define EST_SIMPLEENROLL_PATH               EST_BASE_PATH EST_APS_ID "/simpleenroll"
+
+#if EST_USE_TLS_CLIENT_CERT
+#define EST_TLS_CLIENT_CERT_PEM             bootstrap_cert_pem
+#define EST_TLS_CLIENT_KEY_PEM              bootstrap_key_pem
+#else
+#define EST_TLS_CLIENT_CERT_PEM             NULL
+#define EST_TLS_CLIENT_KEY_PEM              NULL
+#endif
+
+#define CACERTS_BUF_SIZE        8192
 #define ENROLL_BUF_SIZE         8192
 #define DER_DECODE_BUF_SIZE     8192
-#define CERT_PEM_B64_BUF_SIZE   6144
+#define CERT_PEM_B64_BUF_SIZE   8192
 #define CERT_INFO_BUF_SIZE      2048
+#define DYNAMIC_SERVER_CA_BUF_SIZE 2048
 #define CSR_CRI_BUF_SIZE        2048
 #define CSR_DER_BUF_SIZE        4096
 #define CSR_B64_BUF_SIZE        6144
@@ -88,6 +123,9 @@ static uint8_t g_csr_b64[CSR_B64_BUF_SIZE];
 static uint8_t g_mldsa_pk[CRYPTO_PUBLICKEYBYTES];
 static uint8_t g_mldsa_sk[CRYPTO_SECRETKEYBYTES];
 static uint8_t g_mldsa_sig[CRYPTO_BYTES];
+#if EST_USE_DYNAMIC_SERVER_CA
+static char g_dynamic_server_ca_pem[DYNAMIC_SERVER_CA_BUF_SIZE];
+#endif
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -545,6 +583,29 @@ int main(void)
   /* USER CODE BEGIN WHILE */
 
   printf("Starting EST test...\r\n");
+  printf("EST profile: %s\r\n", EST_PROFILE_NAME);
+  printf("EST APS/DMS ID: %s\r\n", EST_APS_ID);
+  printf("TLS client certificate: %s\r\n", EST_USE_TLS_CLIENT_CERT ? "enabled" : "disabled");
+
+#if EST_USE_DYNAMIC_SERVER_CA
+  size_t server_ca_len = 0;
+
+  printf("Acquiring TLS server certificate via UART proxy...\r\n");
+
+  ret = tls_port_fetch_server_cert(
+      EST_HOST,
+      EST_PORT,
+      g_dynamic_server_ca_pem,
+      sizeof(g_dynamic_server_ca_pem),
+      &server_ca_len);
+
+  if (ret != 0) {
+      printf("TLS server certificate acquisition failed: %d\r\n", ret);
+      while (1);
+  }
+
+  printf("TLS server certificate acquired (%u bytes)\r\n", (unsigned) server_ca_len);
+#endif
 
    /* ===================================================== */
    /* STEP 1: GET CACERTS */
@@ -556,7 +617,7 @@ int main(void)
        EST_HOST,
        EST_PORT,
        EST_CACERTS_PATH,
-       test_ca_pem,
+       EST_SERVER_CA_PEM,
        g_cacerts_buf,
        sizeof(g_cacerts_buf),
        &cacerts_len);
@@ -587,7 +648,7 @@ int main(void)
    }
 
    ret = csr_build_certification_request_info(
-       "device-01",
+       EST_DEVICE_COMMON_NAME,
        g_mldsa_pk, sizeof(g_mldsa_pk),
        g_csr_cri, sizeof(g_csr_cri),
        &csr_cri_len);
@@ -660,9 +721,9 @@ int main(void)
        EST_HOST,
        EST_PORT,
        EST_SIMPLEENROLL_PATH,
-       test_ca_pem,
-       bootstrap_cert_pem,
-       bootstrap_key_pem,
+       EST_SERVER_CA_PEM,
+       EST_TLS_CLIENT_CERT_PEM,
+       EST_TLS_CLIENT_KEY_PEM,
        g_csr_b64,
        csr_b64_len,
        g_enroll_buf,

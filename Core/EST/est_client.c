@@ -374,6 +374,7 @@ static int est_https_request(const char *host,
                            "%s %s HTTP/1.1\r\n"
                            "Host: %s:%u\r\n"
                            "Connection: close\r\n"
+                           "Accept: application/pkcs7-mime\r\n"
                            "Content-Type: %s\r\n"
                            "Content-Transfer-Encoding: %s\r\n"
                            "Content-Length: %u\r\n"
@@ -390,6 +391,7 @@ static int est_https_request(const char *host,
                            "%s %s HTTP/1.1\r\n"
                            "Host: %s:%u\r\n"
                            "Connection: close\r\n"
+                           "Accept: application/pkcs7-mime\r\n"
                            "Content-Type: %s\r\n"
                            "Content-Length: %u\r\n"
                            "\r\n",
@@ -405,6 +407,7 @@ static int est_https_request(const char *host,
                        "%s %s HTTP/1.1\r\n"
                        "Host: %s:%u\r\n"
                        "Connection: close\r\n"
+                       "Accept: application/pkcs7-mime\r\n"
                        "\r\n",
                        method,
                        path,

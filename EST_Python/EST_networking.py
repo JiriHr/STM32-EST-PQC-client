@@ -2,6 +2,7 @@ import argparse
 import glob
 import serial
 import socket
+import ssl
 import sys
 import time
 
@@ -67,6 +68,79 @@ connected = False
 
 print(f"Proxy started on {serial_port} @ {args.baudrate}")
 
+def handle_connect_command(cmd):
+    global sock, connected
+
+    parts = cmd.split()
+    if len(parts) != 3:
+        ser.write(b"ERR\n")
+        ser.flush()
+        return
+
+    host = parts[1]
+
+    try:
+        port = int(parts[2])
+    except ValueError:
+        ser.write(b"ERR\n")
+        ser.flush()
+        return
+
+    close_socket()
+
+    try:
+        sock = socket.create_connection((host, port), timeout=5)
+        sock.setblocking(False)
+        connected = True
+        ser.write(b"OK\n")
+        ser.flush()
+        print(f"Connected to {host}:{port}")
+    except Exception as e:
+        ser.write(b"ERR\n")
+        ser.flush()
+        print("Connect failed:", e)
+        close_socket()
+
+
+def handle_cert_command(cmd):
+    parts = cmd.split()
+    if len(parts) != 3:
+        ser.write(b"ERR\n")
+        ser.flush()
+        return
+
+    host = parts[1]
+
+    try:
+        port = int(parts[2])
+    except ValueError:
+        ser.write(b"ERR\n")
+        ser.flush()
+        return
+
+    close_socket()
+
+    try:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+
+        with socket.create_connection((host, port), timeout=5) as raw_sock:
+            with context.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
+                der_cert = tls_sock.getpeercert(binary_form=True)
+
+        pem_cert = ssl.DER_cert_to_PEM_cert(der_cert).encode("ascii")
+        ser.write(b"OK\n")
+        ser.write(len(pem_cert).to_bytes(2, "big"))
+        ser.write(pem_cert)
+        ser.flush()
+        print(f"Fetched server certificate from {host}:{port} ({len(pem_cert)} bytes)")
+    except Exception as e:
+        ser.write(b"ERR\n")
+        ser.flush()
+        print("Certificate fetch failed:", e)
+
+
 def send_eof_frame():
     try:
         ser.write(b"\x00\x00")
@@ -102,40 +176,31 @@ while True:
 
             print("UART CMD:", repr(cmd))
 
-            if cmd.startswith("CONNECT "):
-                parts = cmd.split()
-                if len(parts) == 3:
-                    host = parts[1]
-
-                    try:
-                        port = int(parts[2])
-                    except ValueError:
-                        ser.write(b"ERR\n")
-                        continue
-
-                    try:
-                        sock = socket.create_connection((host, port), timeout=5)
-                        sock.setblocking(False)
-                        connected = True
-                        ser.write(b"OK\n")
-                        ser.flush()
-                        print(f"Connected to {host}:{port}")
-                    except Exception as e:
-                        ser.write(b"ERR\n")
-                        ser.flush()
-                        print("Connect failed:", e)
-                        close_socket()
-                else:
-                    ser.write(b"ERR\n")
-                    ser.flush()
+            if cmd.startswith("CERT "):
+                handle_cert_command(cmd)
+            elif cmd.startswith("CONNECT "):
+                handle_connect_command(cmd)
             else:
-                print("Ignoring data before CONNECT")
+                print("Ignoring data before CERT/CONNECT")
 
         time.sleep(0.01)
         continue
 
     data = ser.read(1024)
     if data:
+        if data.startswith(b"CERT ") or data.startswith(b"CONNECT "):
+            try:
+                cmd = data.decode("utf-8", errors="ignore").strip()
+            except Exception:
+                cmd = ""
+            print("UART CMD while connected:", repr(cmd))
+            if cmd.startswith("CERT "):
+                handle_cert_command(cmd)
+            else:
+                handle_connect_command(cmd)
+            time.sleep(0.01)
+            continue
+
         try:
             sock.sendall(data)
             print(f"UART -> NET: {len(data)} bytes")

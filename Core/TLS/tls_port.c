@@ -41,18 +41,121 @@ static int uart_read_exact(uint8_t *buf, size_t len, uint32_t timeout_ms)
     return 0;
 }
 
+static void uart_drain_rx(uint32_t duration_ms)
+{
+    uint32_t start = HAL_GetTick();
+    uint8_t ch;
+
+    while ((HAL_GetTick() - start) < duration_ms) {
+        if (HAL_UART_Receive(&huart1, &ch, 1, 1) == HAL_OK) {
+            start = HAL_GetTick();
+        }
+    }
+}
+
+static int uart_read_line(char *resp, size_t resp_size, uint32_t timeout_ms)
+{
+    uint32_t start = HAL_GetTick();
+    size_t idx = 0;
+    uint8_t ch;
+
+    if (resp == NULL || resp_size == 0U) {
+        return -1;
+    }
+
+    while ((HAL_GetTick() - start) < timeout_ms && idx < resp_size - 1U) {
+        if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK) {
+            if (ch == '\0') {
+                continue;
+            }
+            resp[idx++] = (char) ch;
+            if (ch == '\n') {
+                break;
+            }
+        }
+    }
+
+    resp[idx] = '\0';
+    return (idx > 0U) ? 0 : -1;
+}
+
+int tls_port_fetch_server_cert(const char *host, uint16_t port, char *out_pem, size_t out_size, size_t *out_len)
+{
+    char cmd[128];
+    char resp[32] = {0};
+    unsigned pem_len = 0;
+    uint8_t hdr[2];
+
+    if (out_len != NULL) {
+        *out_len = 0;
+    }
+
+    if (host == NULL || out_pem == NULL || out_size == 0U || out_len == NULL) {
+        return -1;
+    }
+
+    printf("tls_port_fetch_server_cert(): host=%s port=%u\r\n", host, (unsigned) port);
+
+    uart_drain_rx(25);
+
+    snprintf(cmd, sizeof(cmd), "CERT %s %u\n", host, (unsigned) port);
+
+    printf("Sending CERT command over UART\r\n");
+
+    if (uart_write_all((const uint8_t *) cmd, strlen(cmd)) < 0) {
+        return -1;
+    }
+
+    if (uart_read_line(resp, sizeof(resp), 5000) != 0) {
+        printf("Proxy cert reply timed out\r\n");
+        return -1;
+    }
+
+    if (strncmp(resp, "OK", 2) != 0) {
+        return -1;
+    }
+
+    if (sscanf(resp, "OK %u", &pem_len) != 1) {
+        if (uart_read_exact(hdr, sizeof(hdr), 5000) != 0) {
+            printf("Proxy cert length frame timed out\r\n");
+            return -1;
+        }
+        pem_len = ((unsigned) hdr[0] << 8) | (unsigned) hdr[1];
+    }
+
+    if (pem_len == 0U) {
+        return -1;
+    }
+
+    if ((size_t) pem_len >= out_size) {
+        printf("Server certificate buffer too small: need %u, have %u\r\n",
+               pem_len + 1U,
+               (unsigned) out_size);
+        return -1;
+    }
+
+    if (uart_read_exact((uint8_t *) out_pem, (size_t) pem_len, 5000) != 0) {
+        return -1;
+    }
+
+    out_pem[pem_len] = '\0';
+    *out_len = (size_t) pem_len;
+    printf("Proxy cert reply OK, payload %u bytes\r\n", pem_len);
+    return 0;
+}
+
 int tls_port_connect(tls_socket_t *sock, const char *host, uint16_t port)
 {
     char cmd[128];
     char resp[16] = {0};
-    size_t idx = 0;
-    uint8_t ch;
 
     if (sock == NULL || host == NULL) {
         return -1;
     }
 
     printf("tls_port_connect(): host=%s port=%u\r\n", host, (unsigned) port);
+
+    uart_drain_rx(25);
 
     snprintf(cmd, sizeof(cmd), "CONNECT %s %u\n", host, (unsigned) port);
 
@@ -63,17 +166,7 @@ int tls_port_connect(tls_socket_t *sock, const char *host, uint16_t port)
         return -1;
     }
 
-    uint32_t start = HAL_GetTick();
-    while ((HAL_GetTick() - start) < 2000 && idx < sizeof(resp) - 1) {
-        if (HAL_UART_Receive(&huart1, &ch, 1, 10) == HAL_OK) {
-            resp[idx++] = (char) ch;
-            if (ch == '\n') {
-                break;
-            }
-        }
-    }
-
-    resp[idx] = '\0';
+    (void) uart_read_line(resp, sizeof(resp), 2000);
 
     printf("Proxy reply raw: %s\r\n", resp);
 
