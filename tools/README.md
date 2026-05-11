@@ -7,7 +7,7 @@ Default flow:
 
 1. Start Lamassu monolithic development server.
 2. Wait for `http://127.0.0.1:8080` to answer.
-3. Run `dp-lamassupqc-main/lamassuiot/PQCscripts/setup_stm.sh`
+3. Run `dp-lamassupqc-EST/lamassuiot/PQCscripts/setup_stm.sh`
    non-interactively for ML-DSA-44.
 4. Optionally run a user-provided STM flash command.
 5. Start the UART proxy.

@@ -25,7 +25,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_LAMASSU_DIR = REPO_ROOT / "dp-lamassupqc-main" / "lamassuiot"
+DEFAULT_LAMASSU_DIR = REPO_ROOT / "dp-lamassupqc-EST" / "lamassuiot"
 DEFAULT_BASE_URL = "http://127.0.0.1:8080"
 DEFAULT_PROXY = REPO_ROOT / "EST_Python" / "EST_networking.py"
 
