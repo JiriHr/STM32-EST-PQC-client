@@ -13,6 +13,7 @@ int tls_port_connect(tls_socket_t *sock, const char *host, uint16_t port);
 int tls_port_fetch_server_cert(const char *host, uint16_t port, char *out_pem, size_t out_size, size_t *out_len);
 int tls_port_send(void *ctx, const unsigned char *buf, size_t len);
 int tls_port_recv(void *ctx, unsigned char *buf, size_t len);
+int tls_port_log_write(const unsigned char *buf, size_t len);
 void tls_port_close(tls_socket_t *sock);
 
 #endif

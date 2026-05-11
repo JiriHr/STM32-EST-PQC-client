@@ -845,8 +845,14 @@ int _write(int file, char *ptr, int len)
 {
     (void) file;
 
-    for (int i = 0; i < len; i++) {
-        ITM_SendChar(*ptr++);
+    if (len <= 0) {
+        return len;
+    }
+
+    if (tls_port_log_write((const unsigned char *) ptr, (size_t) len) < 0) {
+        for (int i = 0; i < len; i++) {
+            ITM_SendChar(*ptr++);
+        }
     }
 
     return len;

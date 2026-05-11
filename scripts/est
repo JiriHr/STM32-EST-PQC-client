@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+if [[ -n "${EST_PYTHON:-}" ]]; then
+  PYTHON="$EST_PYTHON"
+elif command -v pyenv >/dev/null 2>&1 && PYENV_PREFIX="$(pyenv prefix EST 2>/dev/null)" && [[ -x "$PYENV_PREFIX/bin/python3" ]]; then
+  PYTHON="$PYENV_PREFIX/bin/python3"
+else
+  PYTHON="python3"
+fi
+
+exec "$PYTHON" "$REPO_ROOT/tools/est_cli.py" "$@"

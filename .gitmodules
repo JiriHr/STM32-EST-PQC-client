@@ -1,0 +1,3 @@
+[submodule "dp-lamassupqc-EST"]
+	path = dp-lamassupqc-EST
+	url = git@github.com:JiriHr/dp-lamassupqc-EST.git

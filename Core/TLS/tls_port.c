@@ -9,6 +9,9 @@
 #include <string.h>
 
 #define TLS_FRAME_MAX 2048
+#define UART_FRAME_LOG  0x01U
+#define UART_FRAME_DATA 0x02U
+#define UART_TX_CHUNK_MAX 1024U
 
 static uint8_t frame_buf[TLS_FRAME_MAX];
 static size_t frame_len = 0;
@@ -20,6 +23,29 @@ static int uart_write_all(const uint8_t *buf, size_t len)
         return (int)len;
     }
     return -1;
+}
+
+static int uart_write_frame(uint8_t type, const unsigned char *buf, size_t len)
+{
+    uint8_t hdr[3];
+
+    if (buf == NULL && len > 0U) {
+        return -1;
+    }
+
+    hdr[0] = type;
+    hdr[1] = (uint8_t) ((len >> 8) & 0xFFU);
+    hdr[2] = (uint8_t) (len & 0xFFU);
+
+    if (uart_write_all(hdr, sizeof(hdr)) < 0) {
+        return -1;
+    }
+
+    if (len > 0U && uart_write_all(buf, len) < 0) {
+        return -1;
+    }
+
+    return 0;
 }
 
 static int uart_read_exact(uint8_t *buf, size_t len, uint32_t timeout_ms)
@@ -184,17 +210,46 @@ int tls_port_connect(tls_socket_t *sock, const char *host, uint16_t port)
 int tls_port_send(void *ctx, const unsigned char *buf, size_t len)
 {
     tls_socket_t *sock = (tls_socket_t *) ctx;
+    size_t written = 0;
 
     if (sock == NULL || !sock->connected) {
         return MBEDTLS_ERR_NET_SEND_FAILED;
     }
 
-    int ret = uart_write_all(buf, len);
-    if (ret < 0) {
-        return MBEDTLS_ERR_NET_SEND_FAILED;
+    while (written < len) {
+        size_t chunk = len - written;
+        if (chunk > UART_TX_CHUNK_MAX) {
+            chunk = UART_TX_CHUNK_MAX;
+        }
+
+        if (uart_write_frame(UART_FRAME_DATA, buf + written, chunk) != 0) {
+            return MBEDTLS_ERR_NET_SEND_FAILED;
+        }
+
+        written += chunk;
     }
 
-    return ret;
+    return (int) len;
+}
+
+int tls_port_log_write(const unsigned char *buf, size_t len)
+{
+    size_t written = 0;
+
+    while (written < len) {
+        size_t chunk = len - written;
+        if (chunk > UART_TX_CHUNK_MAX) {
+            chunk = UART_TX_CHUNK_MAX;
+        }
+
+        if (uart_write_frame(UART_FRAME_LOG, buf + written, chunk) != 0) {
+            return -1;
+        }
+
+        written += chunk;
+    }
+
+    return (int) len;
 }
 
 int tls_port_recv(void *ctx, unsigned char *buf, size_t len)
