@@ -17,6 +17,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 
@@ -27,6 +29,8 @@ DEFAULT_ELF = REPO_ROOT / DEFAULT_CONFIG / f"{PROJECT_NAME}.elf"
 DEFAULT_PROXY = REPO_ROOT / "EST_Python" / "EST_networking.py"
 DEFAULT_ADHOC_RA = REPO_ROOT / "EST_Python" / "adhoc_ra" / "adhoc_est_ra.py"
 DEFAULT_DEMO_RUNNER = REPO_ROOT / "tools" / "est_demo_runner.py"
+DEFAULT_LAMASSU_DIR = REPO_ROOT / "dp-lamassupqc-EST" / "lamassuiot"
+DEFAULT_LAMASSU_BASE_URL = "http://127.0.0.1:8080"
 PYTHON_REQUIREMENTS = REPO_ROOT / "EST_Python" / "requirements.txt"
 FLASH_ADDRESS = "0x08000000"
 PROFILE_DEFINES = {
@@ -51,6 +55,18 @@ def which(name: str) -> str | None:
 def run(cmd: list[str], cwd: Path | None = None) -> None:
     log("running: " + " ".join(cmd))
     result = subprocess.run(cmd, cwd=str(cwd) if cwd is not None else None)
+    if result.returncode != 0:
+        fail(f"command failed with exit code {result.returncode}", result.returncode)
+
+
+def run_with_input(cmd: list[str], cwd: Path | None = None, stdin: str | None = None) -> None:
+    log("running: " + " ".join(cmd))
+    result = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd is not None else None,
+        input=stdin,
+        text=True,
+    )
     if result.returncode != 0:
         fail(f"command failed with exit code {result.returncode}", result.returncode)
 
@@ -83,6 +99,11 @@ def require_file(path: Path, description: str) -> None:
         fail(f"{description} not found: {path}")
 
 
+def require_command(name: str) -> None:
+    if which(name) is None:
+        fail(f"required command not found in PATH: {name}")
+
+
 def has_python_module(module: str) -> bool:
     result = subprocess.run(
         [sys.executable, "-c", f"import {module}"],
@@ -90,6 +111,29 @@ def has_python_module(module: str) -> bool:
         stderr=subprocess.DEVNULL,
     )
     return result.returncode == 0
+
+
+def wait_for_http(base_url: str, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(base_url, timeout=2):
+                return
+        except urllib.error.HTTPError:
+            return
+        except Exception as exc:
+            last_error = exc
+            time.sleep(1)
+
+    fail(f"Lamassu did not become reachable at {base_url}: {last_error}")
+
+
+def lamassu_setup_answers(base_url: str, alg: str) -> str:
+    if base_url == DEFAULT_LAMASSU_BASE_URL:
+        return f"y\n{alg}\ny\n"
+    return f"n\n{base_url}\n{alg}\ny\n"
 
 
 def find_cubeide(explicit: str | None) -> str | None:
@@ -189,6 +233,9 @@ def command_doctor(args: argparse.Namespace) -> None:
     makefile = REPO_ROOT / DEFAULT_CONFIG / "makefile"
     print(f"{'generated makefile':24} {makefile if makefile.exists() else 'missing'}")
     print(f"{'firmware elf':24} {DEFAULT_ELF if DEFAULT_ELF.exists() else 'missing'}")
+    print(f"{'Lamassu submodule':24} {DEFAULT_LAMASSU_DIR if DEFAULT_LAMASSU_DIR.exists() else 'missing'}")
+    setup_script = DEFAULT_LAMASSU_DIR / "PQCscripts" / "setup_stm.sh"
+    print(f"{'Lamassu STM setup':24} {setup_script if setup_script.exists() else 'missing'}")
 
     if args.install:
         command_install_deps(args)
@@ -373,6 +420,105 @@ def command_adhoc_ra(args: argparse.Namespace) -> None:
     run(cmd, cwd=REPO_ROOT)
 
 
+def command_lamassu_setup(args: argparse.Namespace) -> None:
+    lamassu_dir = args.lamassu_dir.resolve()
+    setup_script = lamassu_dir / "PQCscripts" / "setup_stm.sh"
+    require_file(setup_script, "Lamassu PQC STM setup script")
+    require_command("curl")
+    require_command("jq")
+
+    if not args.no_wait:
+        log(f"waiting for Lamassu at {args.base_url}")
+        wait_for_http(args.base_url, args.timeout)
+
+    run_with_input(
+        ["bash", str(setup_script)],
+        cwd=setup_script.parent,
+        stdin=lamassu_setup_answers(args.base_url, args.alg),
+    )
+
+
+def command_lamassu_run(args: argparse.Namespace) -> None:
+    require_file(DEFAULT_PROXY, "UART proxy script")
+
+    if not args.no_wait:
+        log(f"checking Lamassu at {args.base_url}")
+        wait_for_http(args.base_url, args.timeout)
+
+    log("if this run stalls or fails after a previous run, unplug and reconnect the board USB cable, then rerun")
+
+    if args.build:
+        build_args = argparse.Namespace(
+            config=DEFAULT_CONFIG,
+            jobs=os.cpu_count() or 4,
+            clean=args.clean,
+            cubeide=False,
+            cubeide_path=None,
+            workspace=REPO_ROOT / ".stm32cubeide-workspace",
+            profile="lamassu",
+        )
+        command_build(build_args)
+
+    if args.flash:
+        flash_args = argparse.Namespace(
+            elf=DEFAULT_ELF,
+            port="SWD",
+            tool="auto",
+            programmer=None,
+        )
+        command_flash(flash_args)
+
+    proxy_cmd = [sys.executable, str(DEFAULT_PROXY), "--baudrate", str(args.baudrate)]
+    if args.serial_port:
+        proxy_cmd.extend(["--port", args.serial_port])
+    if args.proxy_verbose:
+        proxy_cmd.append("--verbose")
+
+    proxy_proc: subprocess.Popen[str] | None = None
+    stm_log_proc: subprocess.Popen[str] | None = None
+
+    try:
+        if args.reset:
+            log("pre-resetting board to stop any previous firmware run before opening UART")
+            if not reset_board():
+                log("no reset tool found; stale UART output may appear until you reset the board manually")
+
+        proxy_proc = start_process("UART proxy", proxy_cmd, cwd=REPO_ROOT)
+        time.sleep(0.5)
+
+        if args.stm_log:
+            log("starting STM ITM log monitor")
+            stm_log_proc = start_stm_log_monitor(
+                reset=args.reset,
+                clock=args.stm_clock,
+                trace=args.stm_trace,
+            )
+            if stm_log_proc is None and args.reset:
+                log("resetting board now that Lamassu and UART proxy are ready")
+                if not reset_board():
+                    log("no reset tool found; reset the board manually now")
+        elif args.reset:
+            log("resetting board now that Lamassu and UART proxy are ready")
+            if not reset_board():
+                log("no reset tool found; reset the board manually now")
+
+        log("Lamassu board services are running. Press Ctrl+C to stop.")
+        while True:
+            if proxy_proc.poll() is not None:
+                fail(f"UART proxy exited with code {proxy_proc.returncode}", proxy_proc.returncode or 1)
+            if stm_log_proc is not None and stm_log_proc.poll() is not None:
+                log(f"STM ITM log monitor exited with code {stm_log_proc.returncode}; continuing without STM log output")
+                stm_log_proc = None
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log("interrupted")
+    finally:
+        if proxy_proc is not None:
+            stop_process("UART proxy", proxy_proc)
+        if stm_log_proc is not None:
+            stop_process("STM ITM log", stm_log_proc)
+
+
 def command_demo(args: argparse.Namespace) -> None:
     require_file(DEFAULT_DEMO_RUNNER, "demo runner")
     cmd = [sys.executable, str(DEFAULT_DEMO_RUNNER)]
@@ -439,7 +585,13 @@ def command_adhoc_demo(args: argparse.Namespace) -> None:
         if ra_proc.poll() is not None:
             fail(f"ad-hoc EST RA exited with code {ra_proc.returncode}", ra_proc.returncode or 1)
 
+        if args.reset:
+            log("pre-resetting board to stop any previous firmware run before opening UART")
+            if not reset_board():
+                log("no reset tool found; stale UART output may appear until you reset the board manually")
+
         proxy_proc = start_process("UART proxy", proxy_cmd, cwd=REPO_ROOT)
+        time.sleep(0.5)
 
         if args.stm_log:
             log("starting STM ITM log monitor")
@@ -527,6 +679,31 @@ def parse_args() -> argparse.Namespace:
     demo.add_argument("--skip-setup", action="store_true")
     demo.add_argument("--skip-proxy", action="store_true")
     demo.set_defaults(func=command_demo)
+
+    lamassu_setup = sub.add_parser("lamassu-setup", help="configure a running Lamassu PQC instance for the STM demo")
+    lamassu_setup.add_argument("--base-url", default=DEFAULT_LAMASSU_BASE_URL)
+    lamassu_setup.add_argument("--alg", choices=("44", "65", "87"), default="44")
+    lamassu_setup.add_argument("--lamassu-dir", type=Path, default=DEFAULT_LAMASSU_DIR)
+    lamassu_setup.add_argument("--timeout", type=float, default=90.0)
+    lamassu_setup.add_argument("--no-wait", action="store_true", help="run setup without waiting for Lamassu first")
+    lamassu_setup.set_defaults(func=command_lamassu_setup)
+
+    lamassu_run = sub.add_parser("lamassu-run", help="run the STM proxy/reset side against an already running Lamassu")
+    lamassu_run.add_argument("--serial-port", help="serial device, e.g. /dev/ttyACM0")
+    lamassu_run.add_argument("--baudrate", type=int, default=115200)
+    lamassu_run.add_argument("--base-url", default=DEFAULT_LAMASSU_BASE_URL)
+    lamassu_run.add_argument("--timeout", type=float, default=90.0)
+    lamassu_run.add_argument("--no-wait", action="store_true", help="do not check the Lamassu HTTP API before starting the proxy")
+    lamassu_run.add_argument("--build", action="store_true", help="build firmware for the Lamassu profile before running")
+    lamassu_run.add_argument("--clean", action="store_true", help="clean before building when --build is used")
+    lamassu_run.add_argument("--flash", action="store_true", help="flash firmware before starting runtime services")
+    lamassu_run.add_argument("--reset", dest="reset", action="store_true", default=True, help="reset the board after the proxy starts")
+    lamassu_run.add_argument("--no-reset", dest="reset", action="store_false", help="do not reset the board after the proxy starts")
+    lamassu_run.add_argument("--stm-log", action="store_true", help="show STM printf output via ST-LINK ITM/SWV using st-trace")
+    lamassu_run.add_argument("--stm-clock", default="64m", help="core clock passed to st-trace, e.g. 64m")
+    lamassu_run.add_argument("--stm-trace", default="100k", help="trace clock passed to st-trace, e.g. 100k, 500k, 2m")
+    lamassu_run.add_argument("--proxy-verbose", action="store_true", help="print raw UART/TCP proxy byte flow")
+    lamassu_run.set_defaults(func=command_lamassu_run)
 
     adhoc_demo = sub.add_parser("adhoc-demo", help="run the local ad-hoc EST RA flow")
     adhoc_demo.add_argument("--serial-port", help="serial device, e.g. /dev/ttyACM0")

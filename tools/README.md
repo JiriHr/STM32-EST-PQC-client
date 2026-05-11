@@ -1,9 +1,17 @@
 # EST Demo Runner
 
-`est_demo_runner.py` is a single host-side entrypoint for the Lamassu PQC EST
-STM demo. It orchestrates the existing tools instead of replacing them.
+`est_demo_runner.py` is the older single host-side entrypoint for the Lamassu
+PQC EST STM demo. The preferred workflow is now split so Lamassu can run in its
+own terminal:
 
-Default flow:
+```bash
+./scripts/est lamassu-setup --alg 44
+./scripts/est lamassu-run --serial-port /dev/ttyACM0
+```
+
+The older runner still exists for one-command orchestration experiments.
+
+Its default flow:
 
 1. Start Lamassu monolithic development server.
 2. Wait for `http://127.0.0.1:8080` to answer.
@@ -12,7 +20,7 @@ Default flow:
 4. Optionally run a user-provided STM flash command.
 5. Start the UART proxy.
 
-Basic usage:
+Legacy usage:
 
 ```bash
 ./scripts/run-est-demo.sh --serial-port /dev/ttyACM0

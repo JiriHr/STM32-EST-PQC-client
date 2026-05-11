@@ -132,7 +132,7 @@ int tls_port_fetch_server_cert(const char *host, uint16_t port, char *out_pem, s
         return -1;
     }
 
-    if (uart_read_line(resp, sizeof(resp), 5000) != 0) {
+    if (uart_read_line(resp, sizeof(resp), 15000) != 0) {
         printf("Proxy cert reply timed out\r\n");
         return -1;
     }
@@ -142,7 +142,7 @@ int tls_port_fetch_server_cert(const char *host, uint16_t port, char *out_pem, s
     }
 
     if (sscanf(resp, "OK %u", &pem_len) != 1) {
-        if (uart_read_exact(hdr, sizeof(hdr), 5000) != 0) {
+        if (uart_read_exact(hdr, sizeof(hdr), 15000) != 0) {
             printf("Proxy cert length frame timed out\r\n");
             return -1;
         }
@@ -160,7 +160,7 @@ int tls_port_fetch_server_cert(const char *host, uint16_t port, char *out_pem, s
         return -1;
     }
 
-    if (uart_read_exact((uint8_t *) out_pem, (size_t) pem_len, 5000) != 0) {
+    if (uart_read_exact((uint8_t *) out_pem, (size_t) pem_len, 15000) != 0) {
         return -1;
     }
 

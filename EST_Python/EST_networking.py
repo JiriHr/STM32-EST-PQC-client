@@ -62,6 +62,8 @@ if args.list_ports:
 try:
     serial_port = choose_serial_port(args.port)
     ser = serial.Serial(serial_port, args.baudrate, timeout=0.1)
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
 except Exception as e:
     print(f"Could not open serial port: {e}", file=sys.stderr)
     sys.exit(2)
@@ -199,8 +201,7 @@ def handle_cert_command(cmd):
                 der_cert = tls_sock.getpeercert(binary_form=True)
 
         pem_cert = ssl.DER_cert_to_PEM_cert(der_cert).encode("ascii")
-        ser.write(b"OK\n")
-        ser.write(len(pem_cert).to_bytes(2, "big"))
+        ser.write(f"OK {len(pem_cert)}\n".encode("ascii"))
         ser.write(pem_cert)
         ser.flush()
         print(f"Fetched server certificate from {host}:{port} ({len(pem_cert)} bytes)")
