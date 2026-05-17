@@ -3,6 +3,7 @@ import argparse
 import base64
 import hashlib
 import http.server
+import json
 import ssl
 import subprocess
 import tempfile
@@ -17,6 +18,31 @@ CN_OID = bytes.fromhex("550403")
 PKCS7_SIGNED_DATA_OID = bytes.fromhex("2A864886F70D010702")
 PKCS7_DATA_OID = bytes.fromhex("2A864886F70D010701")
 MLDSA44_SIGNATURE_LEN = 2420
+
+
+def monotonic_ns() -> int:
+    return time.monotonic_ns()
+
+
+def wall_time() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def emit_measurement(server, event: str, **fields) -> None:
+    path = getattr(server, "measure_log", None)
+    if path is None:
+        return
+
+    record = {
+        "source": "adhoc_ra",
+        "event": event,
+        "wall_time": wall_time(),
+        "monotonic_ns": monotonic_ns(),
+        **fields,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def pem_to_pkcs7_b64(pem: str) -> bytes:
@@ -237,35 +263,104 @@ class AdhocEstRa(http.server.BaseHTTPRequestHandler):
     server_version = "AdhocESTRA/0.1"
 
     def do_GET(self) -> None:
+        started_ns = monotonic_ns()
         if self.path != EST_CACERTS_PATH:
             self.send_error(404)
+            emit_measurement(
+                self.server,
+                "http_request",
+                method="GET",
+                path=self.path,
+                status=404,
+                duration_ns=monotonic_ns() - started_ns,
+            )
             return
 
         print("GET cacerts")
         self.send_est_pkcs7(self.server.cacerts_body)
+        emit_measurement(
+            self.server,
+            "http_request",
+            method="GET",
+            path=self.path,
+            operation="cacerts",
+            status=200,
+            response_body_bytes=len(self.server.cacerts_body),
+            duration_ns=monotonic_ns() - started_ns,
+        )
 
     def do_POST(self) -> None:
+        started_ns = monotonic_ns()
         if self.path != EST_SIMPLEENROLL_PATH:
             self.send_error(404)
+            emit_measurement(
+                self.server,
+                "http_request",
+                method="POST",
+                path=self.path,
+                status=404,
+                duration_ns=monotonic_ns() - started_ns,
+            )
             return
 
         content_length = int(self.headers.get("Content-Length", "0"))
+        read_started_ns = monotonic_ns()
         body = self.rfile.read(content_length)
+        read_duration_ns = monotonic_ns() - read_started_ns
+
+        decode_started_ns = monotonic_ns()
         csr_der = base64.b64decode(compact_base64(body), validate=True)
+        decode_duration_ns = monotonic_ns() - decode_started_ns
 
         print(f"POST simpleenroll: body={len(body)} bytes csr_der={len(csr_der)} bytes")
         try:
             serial = self.server.next_serial()
+            cert_started_ns = monotonic_ns()
             cert_der, common_name = build_mldsa44_certificate(csr_der, serial)
+            cert_duration_ns = monotonic_ns() - cert_started_ns
             print(
                 "Issued structural ML-DSA-44 certificate: "
                 f"serial={serial} subject CN={common_name} der={len(cert_der)} bytes"
             )
         except Exception as exc:
             self.send_error(400, f"invalid ML-DSA-44 CSR: {exc}")
+            emit_measurement(
+                self.server,
+                "http_request",
+                method="POST",
+                path=self.path,
+                operation="simpleenroll",
+                status=400,
+                request_body_bytes=len(body),
+                csr_der_bytes=len(csr_der) if "csr_der" in locals() else 0,
+                error=str(exc),
+                duration_ns=monotonic_ns() - started_ns,
+            )
             return
 
-        self.send_est_pkcs7(cert_der_to_pkcs7_b64(cert_der))
+        pkcs7_started_ns = monotonic_ns()
+        pkcs7_body = cert_der_to_pkcs7_b64(cert_der)
+        pkcs7_duration_ns = monotonic_ns() - pkcs7_started_ns
+        self.send_est_pkcs7(pkcs7_body)
+        emit_measurement(
+            self.server,
+            "http_request",
+            method="POST",
+            path=self.path,
+            operation="simpleenroll",
+            status=200,
+            request_body_bytes=len(body),
+            csr_der_bytes=len(csr_der),
+            cert_der_bytes=len(cert_der),
+            response_body_bytes=len(pkcs7_body),
+            serial=serial,
+            subject_common_name=common_name,
+            read_duration_ns=read_duration_ns,
+            base64_decode_duration_ns=decode_duration_ns,
+            cert_build_duration_ns=cert_duration_ns,
+            pkcs7_build_duration_ns=pkcs7_duration_ns,
+            duration_ns=monotonic_ns() - started_ns,
+        )
 
     def send_est_pkcs7(self, body: bytes) -> None:
         self.send_response(200)
@@ -281,9 +376,10 @@ class AdhocEstRa(http.server.BaseHTTPRequestHandler):
 
 
 class EstHttpServer(http.server.ThreadingHTTPServer):
-    def __init__(self, server_address, handler_class, cacerts_body: bytes):
+    def __init__(self, server_address, handler_class, cacerts_body: bytes, measure_log: Path | None = None):
         super().__init__(server_address, handler_class)
         self.cacerts_body = cacerts_body
+        self.measure_log = measure_log
         self._serial = 1
 
     def next_serial(self) -> int:
@@ -298,14 +394,21 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8443)
     parser.add_argument("--cert", default=str(Path(__file__).with_name("server.cert.pem")))
     parser.add_argument("--key", default=str(Path(__file__).with_name("server.key.pem")))
+    parser.add_argument("--measure-log", type=Path, help="append ad-hoc RA measurements as JSONL")
     args = parser.parse_args()
 
+    process_started_ns = monotonic_ns()
     ca_pem = Path(args.cert).read_text(encoding="ascii")
+
+    cacerts_started_ns = monotonic_ns()
+    cacerts_body = pem_to_pkcs7_b64(ca_pem)
+    cacerts_build_duration_ns = monotonic_ns() - cacerts_started_ns
 
     server = EstHttpServer(
         (args.host, args.port),
         AdhocEstRa,
-        cacerts_body=pem_to_pkcs7_b64(ca_pem),
+        cacerts_body=cacerts_body,
+        measure_log=args.measure_log,
     )
 
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -315,6 +418,15 @@ def main() -> None:
     print(f"Ad-hoc EST RA listening on https://{args.host}:{args.port}")
     print(f"  cacerts:      {EST_CACERTS_PATH}")
     print(f"  simpleenroll: {EST_SIMPLEENROLL_PATH}")
+    emit_measurement(
+        server,
+        "server_start",
+        host=args.host,
+        port=args.port,
+        cacerts_body_bytes=len(cacerts_body),
+        cacerts_build_duration_ns=cacerts_build_duration_ns,
+        startup_duration_ns=monotonic_ns() - process_started_ns,
+    )
     server.serve_forever()
 
 

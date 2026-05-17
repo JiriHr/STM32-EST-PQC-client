@@ -31,6 +31,7 @@ DEFAULT_ADHOC_RA = REPO_ROOT / "EST_Python" / "adhoc_ra" / "adhoc_est_ra.py"
 DEFAULT_DEMO_RUNNER = REPO_ROOT / "tools" / "est_demo_runner.py"
 DEFAULT_LAMASSU_DIR = REPO_ROOT / "dp-lamassupqc-EST" / "lamassuiot"
 DEFAULT_LAMASSU_BASE_URL = "http://127.0.0.1:8080"
+DEFAULT_LOG_DIR = REPO_ROOT / "logs"
 PYTHON_REQUIREMENTS = REPO_ROOT / "EST_Python" / "requirements.txt"
 FLASH_ADDRESS = "0x08000000"
 PROFILE_DEFINES = {
@@ -79,6 +80,32 @@ def start_process(name: str, cmd: list[str], cwd: Path | None = None) -> subproc
         text=True,
         start_new_session=True,
     )
+
+
+def make_measure_log_path(prefix: str, requested: Path | None) -> Path:
+    if requested is not None:
+        path = requested.resolve()
+    else:
+        DEFAULT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = DEFAULT_LOG_DIR / f"{prefix}-{stamp}.jsonl"
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def append_measurement(path: Path, source: str, event: str, **fields) -> None:
+    import json
+
+    record = {
+        "source": source,
+        "event": event,
+        "wall_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "monotonic_ns": time.monotonic_ns(),
+        **fields,
+    }
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def stop_process(name: str, proc: subprocess.Popen[str]) -> None:
@@ -400,6 +427,8 @@ def command_proxy(args: argparse.Namespace) -> None:
         cmd.extend(["--port", args.serial_port])
     if args.verbose:
         cmd.append("--verbose")
+    if args.measure_log:
+        cmd.extend(["--measure-log", str(args.measure_log)])
     run(cmd, cwd=REPO_ROOT)
 
 
@@ -417,6 +446,8 @@ def command_adhoc_ra(args: argparse.Namespace) -> None:
         cmd.extend(["--cert", args.cert])
     if args.key:
         cmd.extend(["--key", args.key])
+    if args.measure_log:
+        cmd.extend(["--measure-log", str(args.measure_log)])
     run(cmd, cwd=REPO_ROOT)
 
 
@@ -539,6 +570,20 @@ def command_demo(args: argparse.Namespace) -> None:
 def command_adhoc_demo(args: argparse.Namespace) -> None:
     require_file(DEFAULT_ADHOC_RA, "ad-hoc RA script")
     require_file(DEFAULT_PROXY, "UART proxy script")
+    measure_log = make_measure_log_path("adhoc-measure", args.measure_log)
+    log(f"writing ad-hoc measurements to {measure_log}")
+    append_measurement(
+        measure_log,
+        "est_cli",
+        "adhoc_demo_start",
+        serial_port=args.serial_port,
+        baudrate=args.baudrate,
+        host=args.host,
+        port=args.port,
+        reset=args.reset,
+        build=args.build,
+        flash=args.flash,
+    )
 
     if args.build:
         build_args = argparse.Namespace(
@@ -568,12 +613,15 @@ def command_adhoc_demo(args: argparse.Namespace) -> None:
         args.host,
         "--port",
         str(args.port),
+        "--measure-log",
+        str(measure_log),
     ]
     proxy_cmd = [sys.executable, str(DEFAULT_PROXY), "--baudrate", str(args.baudrate)]
     if args.serial_port:
         proxy_cmd.extend(["--port", args.serial_port])
     if args.proxy_verbose:
         proxy_cmd.append("--verbose")
+    proxy_cmd.extend(["--measure-log", str(measure_log)])
 
     ra_proc: subprocess.Popen[str] | None = None
     proxy_proc: subprocess.Popen[str] | None = None
@@ -581,16 +629,29 @@ def command_adhoc_demo(args: argparse.Namespace) -> None:
 
     try:
         ra_proc = start_process("ad-hoc EST RA", ra_cmd, cwd=REPO_ROOT)
+        append_measurement(measure_log, "est_cli", "process_start", name="ad-hoc EST RA", pid=ra_proc.pid)
         time.sleep(0.5)
         if ra_proc.poll() is not None:
             fail(f"ad-hoc EST RA exited with code {ra_proc.returncode}", ra_proc.returncode or 1)
 
         if args.reset:
             log("pre-resetting board to stop any previous firmware run before opening UART")
+            reset_started_ns = time.monotonic_ns()
             if not reset_board():
                 log("no reset tool found; stale UART output may appear until you reset the board manually")
+                append_measurement(measure_log, "est_cli", "board_reset", phase="pre_proxy", status="unavailable")
+            else:
+                append_measurement(
+                    measure_log,
+                    "est_cli",
+                    "board_reset",
+                    phase="pre_proxy",
+                    status="ok",
+                    duration_ns=time.monotonic_ns() - reset_started_ns,
+                )
 
         proxy_proc = start_process("UART proxy", proxy_cmd, cwd=REPO_ROOT)
+        append_measurement(measure_log, "est_cli", "process_start", name="UART proxy", pid=proxy_proc.pid)
         time.sleep(0.5)
 
         if args.stm_log:
@@ -606,8 +667,19 @@ def command_adhoc_demo(args: argparse.Namespace) -> None:
                     log("no reset tool found; reset the board manually now")
         elif args.reset:
             log("resetting board now that ad-hoc RA and UART proxy are ready")
+            reset_started_ns = time.monotonic_ns()
             if not reset_board():
                 log("no reset tool found; reset the board manually now")
+                append_measurement(measure_log, "est_cli", "board_reset", phase="post_proxy", status="unavailable")
+            else:
+                append_measurement(
+                    measure_log,
+                    "est_cli",
+                    "board_reset",
+                    phase="post_proxy",
+                    status="ok",
+                    duration_ns=time.monotonic_ns() - reset_started_ns,
+                )
 
         log("ad-hoc demo services are running. Press Ctrl+C to stop.")
         while True:
@@ -621,13 +693,17 @@ def command_adhoc_demo(args: argparse.Namespace) -> None:
             time.sleep(1)
     except KeyboardInterrupt:
         log("interrupted")
+        append_measurement(measure_log, "est_cli", "interrupted")
     finally:
         if proxy_proc is not None:
+            append_measurement(measure_log, "est_cli", "process_stop_request", name="UART proxy", pid=proxy_proc.pid)
             stop_process("UART proxy", proxy_proc)
         if stm_log_proc is not None:
             stop_process("STM ITM log", stm_log_proc)
         if ra_proc is not None:
+            append_measurement(measure_log, "est_cli", "process_stop_request", name="ad-hoc EST RA", pid=ra_proc.pid)
             stop_process("ad-hoc EST RA", ra_proc)
+        append_measurement(measure_log, "est_cli", "adhoc_demo_stop")
 
 
 def parse_args() -> argparse.Namespace:
@@ -662,6 +738,7 @@ def parse_args() -> argparse.Namespace:
     proxy.add_argument("--serial-port", help="serial device, e.g. /dev/ttyACM0")
     proxy.add_argument("--baudrate", type=int, default=115200)
     proxy.add_argument("--verbose", action="store_true", help="print raw UART/TCP proxy byte flow")
+    proxy.add_argument("--measure-log", type=Path, help="append proxy measurements as JSONL")
     proxy.set_defaults(func=command_proxy)
 
     adhoc = sub.add_parser("adhoc-ra", help="start the local ad-hoc EST RA")
@@ -669,6 +746,7 @@ def parse_args() -> argparse.Namespace:
     adhoc.add_argument("--port", type=int, default=8443)
     adhoc.add_argument("--cert")
     adhoc.add_argument("--key")
+    adhoc.add_argument("--measure-log", type=Path, help="append ad-hoc RA measurements as JSONL")
     adhoc.set_defaults(func=command_adhoc_ra)
 
     demo = sub.add_parser("demo", help="run the Lamassu EST demo orchestration")
@@ -719,6 +797,7 @@ def parse_args() -> argparse.Namespace:
     adhoc_demo.add_argument("--stm-clock", default="64m", help="core clock passed to st-trace, e.g. 64m")
     adhoc_demo.add_argument("--stm-trace", default="100k", help="trace clock passed to st-trace, e.g. 100k, 500k, 2m")
     adhoc_demo.add_argument("--proxy-verbose", action="store_true", help="print raw UART/TCP proxy byte flow")
+    adhoc_demo.add_argument("--measure-log", type=Path, help="measurement JSONL path; defaults to logs/adhoc-measure-<timestamp>.jsonl")
     adhoc_demo.set_defaults(func=command_adhoc_demo)
 
     return parser.parse_args()

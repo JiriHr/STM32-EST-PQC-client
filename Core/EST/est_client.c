@@ -13,6 +13,7 @@
 #include "mbedtls/debug.h"
 #include "mbedtls/pk.h"
 
+#include "est_measure.h"
 #include "tls_port.h"
 
 #define EST_RX_CHUNK_SIZE          1024
@@ -196,6 +197,8 @@ static int est_https_request(const char *host,
                              size_t *out_body_len)
 {
     int ret;
+    const char *measure_op;
+    uint32_t measure_start;
     uint8_t rx_chunk[EST_RX_CHUNK_SIZE];
     char req_headers[896];
     size_t resp_len = 0;
@@ -226,6 +229,7 @@ static int est_https_request(const char *host,
         ret = -1;
         goto cleanup;
     }
+    measure_op = (strcmp(method, "POST") == 0) ? "simpleenroll" : "cacerts";
 
     printf("EST request start\r\n");
     printf("  host=%s\r\n", host);
@@ -248,6 +252,7 @@ static int est_https_request(const char *host,
     }
 
     printf("Parsing CA certificate...\r\n");
+    measure_start = est_measure_start();
     ret = mbedtls_x509_crt_parse(&cacert,
                                  (const unsigned char *) ca_pem,
                                  strlen(ca_pem) + 1);
@@ -255,9 +260,11 @@ static int est_https_request(const char *host,
         print_mbedtls_error("mbedtls_x509_crt_parse(ca)", ret);
         goto cleanup;
     }
+    est_measure_cycles2("x509_parse_ca", measure_op, est_measure_elapsed(measure_start));
 
     if (client_cert_pem != NULL && client_cert_pem[0] != '\0') {
         printf("Parsing client certificate...\r\n");
+        measure_start = est_measure_start();
         ret = mbedtls_x509_crt_parse(&client_cert,
                                      (const unsigned char *) client_cert_pem,
                                      strlen(client_cert_pem) + 1);
@@ -265,10 +272,12 @@ static int est_https_request(const char *host,
             print_mbedtls_error("mbedtls_x509_crt_parse(client_cert)", ret);
             goto cleanup;
         }
+        est_measure_cycles2("x509_parse_client_cert", measure_op, est_measure_elapsed(measure_start));
     }
 
     if (client_key_pem != NULL && client_key_pem[0] != '\0') {
         printf("Parsing client private key...\r\n");
+        measure_start = est_measure_start();
         ret = mbedtls_pk_parse_key(&client_key,
                                    (const unsigned char *) client_key_pem,
                                    strlen(client_key_pem) + 1,
@@ -278,6 +287,7 @@ static int est_https_request(const char *host,
             print_mbedtls_error("mbedtls_pk_parse_key", ret);
             goto cleanup;
         }
+        est_measure_cycles2("pk_parse_client_key", measure_op, est_measure_elapsed(measure_start));
     }
 
     if ((client_cert_pem != NULL && client_cert_pem[0] != '\0') ^
@@ -288,14 +298,17 @@ static int est_https_request(const char *host,
     }
 
     printf("Connecting via transport...\r\n");
+    measure_start = est_measure_start();
     ret = tls_port_connect(&sock, host, port);
     if (ret != 0) {
         printf("tls_port_connect failed\r\n");
         ret = -1;
         goto cleanup;
     }
+    est_measure_cycles2("transport_connect", measure_op, est_measure_elapsed(measure_start));
 
     printf("Configuring TLS...\r\n");
+    measure_start = est_measure_start();
     ret = mbedtls_ssl_config_defaults(&conf,
                                       MBEDTLS_SSL_IS_CLIENT,
                                       MBEDTLS_SSL_TRANSPORT_STREAM,
@@ -335,14 +348,17 @@ static int est_https_request(const char *host,
     }
 
     mbedtls_ssl_set_bio(&ssl, &sock, tls_port_send, tls_port_recv, NULL);
+    est_measure_cycles2("tls_config", measure_op, est_measure_elapsed(measure_start));
 
     printf("Starting TLS handshake with %s:%u\r\n", host, (unsigned) port);
 
+    measure_start = est_measure_start();
     while (1) {
         ret = mbedtls_ssl_handshake(&ssl);
 
         if (ret == 0) {
             printf("TLS handshake OK\r\n");
+            est_measure_cycles2("tls_handshake", measure_op, est_measure_elapsed(measure_start));
             break;
         }
 
@@ -422,23 +438,28 @@ static int est_https_request(const char *host,
     }
 
     printf("Sending HTTP request headers...\r\n");
+    measure_start = est_measure_start();
     ret = ssl_write_all(&ssl, (const uint8_t *) req_headers, strlen(req_headers));
     if (ret != 0) {
         print_mbedtls_error("ssl_write_all(headers)", ret);
         goto cleanup;
     }
+    est_measure_cycles2("http_send_headers", measure_op, est_measure_elapsed(measure_start));
 
     if (body != NULL && body_len > 0) {
         printf("Sending HTTP request body (%u bytes)...\r\n", (unsigned) body_len);
+        measure_start = est_measure_start();
         ret = ssl_write_all(&ssl, body, body_len);
         if (ret != 0) {
             print_mbedtls_error("ssl_write_all(body)", ret);
             goto cleanup;
         }
+        est_measure_cycles2("http_send_body", measure_op, est_measure_elapsed(measure_start));
     }
 
     printf("HTTP request sent\r\n");
 
+    measure_start = est_measure_start();
     while (1) {
         ret = mbedtls_ssl_read(&ssl, rx_chunk, sizeof(rx_chunk));
 
@@ -472,6 +493,8 @@ static int est_https_request(const char *host,
         memcpy(&g_http_response_buf[resp_len], rx_chunk, (size_t) ret);
         resp_len += (size_t) ret;
     }
+    est_measure_cycles2("http_read_response", measure_op, est_measure_elapsed(measure_start));
+    est_measure_size((strcmp(method, "POST") == 0) ? "simpleenroll_http_response" : "cacerts_http_response", resp_len);
 
     if (resp_len == 0) {
         printf("Empty HTTP response\r\n");
@@ -511,6 +534,7 @@ static int est_https_request(const char *host,
         memcpy(out_body, &g_http_response_buf[header_body_off], body_bytes);
         *out_body_len = body_bytes;
 
+        est_measure_size((strcmp(method, "POST") == 0) ? "simpleenroll_http_body" : "cacerts_http_body", body_bytes);
         printf("HTTP body length: %u bytes\r\n", (unsigned) body_bytes);
     }
 

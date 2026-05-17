@@ -121,6 +121,7 @@ Useful options:
 - `--no-reset`: do not reset the board after host services start
 - `--proxy-verbose`: show raw UART/TCP byte-flow logs
 - `--stm-log`: attempt ITM/SWV logging with `st-trace`
+- `--measure-log PATH`: write ad-hoc measurement JSONL to a specific path
 
 The normal UART proxy is quiet about raw TLS transport bytes, but it prints STM
 firmware `printf` output carried in UART log frames. Use `--proxy-verbose` only
@@ -137,6 +138,15 @@ It avoids Lamassu and runs everything locally in Python.
 ./scripts/est flash
 ./scripts/est adhoc-demo --serial-port /dev/ttyACM0
 ```
+
+Each `adhoc-demo` run writes a measurement file under `logs/`, for example
+`logs/adhoc-measure-20260517-153000.jsonl`. The file contains timestamped JSON
+records from the CLI, the UART proxy, and the ad-hoc RA. It captures dynamic
+data such as reset timing, request durations, CSR/certificate/CMS sizes, UART
+byte counts, and STM log output. The firmware also emits `MEASURE` lines from
+the Cortex-M DWT cycle counter; the proxy stores these as structured
+`stm_cycles`, `stm_size`, and `stm_meta` JSON records. Use `--measure-log PATH`
+to choose the output file explicitly.
 
 `adhoc-demo` starts:
 

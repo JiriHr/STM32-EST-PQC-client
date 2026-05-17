@@ -5,6 +5,7 @@
 #include <string.h>
 #include <stdio.h>
 
+#include "est_measure.h"
 #include "pqc_mldsa44.h"
 #include "pqc_mlkem512.h"
 #include "../Middlewares/PQC/common/fips202.h"
@@ -362,18 +363,23 @@ static int cms_pqc_signed_data_self_test(void)
     size_t sig_len = 0;
     size_t cms_len = 0;
     size_t i;
+    uint32_t measure_start;
+    uint32_t measure_total = est_measure_start();
     int ret;
 
     for (i = 0; i < sizeof(g_plaintext); i++) {
         g_plaintext[i] = (uint8_t) ('a' + (i % 26U));
     }
 
+    measure_start = est_measure_start();
     ret = pqc_mldsa44_keypair(g_mldsa_pk, g_mldsa_sk);
     if (ret != 0) {
         printf("ML-DSA-44 CMS keypair failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_signed_mldsa_keypair", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = pqc_mldsa44_sign(g_mldsa_sig,
                            &sig_len,
                            g_plaintext,
@@ -383,7 +389,10 @@ static int cms_pqc_signed_data_self_test(void)
         printf("ML-DSA-44 CMS signing failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_signed_mldsa_sign", est_measure_elapsed(measure_start));
+    est_measure_size("cms_signed_mldsa_signature", sig_len);
 
+    measure_start = est_measure_start();
     ret = cms_pqc_build_signed_data(g_plaintext,
                                     sizeof(g_plaintext),
                                     g_mldsa_sig,
@@ -395,13 +404,18 @@ static int cms_pqc_signed_data_self_test(void)
         printf("CMS SignedData assembly failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_signed_assemble", est_measure_elapsed(measure_start));
+    est_measure_size("cms_signed_der", cms_len);
 
+    measure_start = est_measure_start();
     ret = cms_find_octet_string_by_len(g_cms_buf, cms_len, sig_len, &parsed_sig);
     if (ret != 0) {
         printf("CMS SignedData signature parse failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_signed_parse_signature", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = pqc_mldsa44_verify(parsed_sig,
                              sig_len,
                              g_plaintext,
@@ -411,6 +425,8 @@ static int cms_pqc_signed_data_self_test(void)
         printf("CMS SignedData ML-DSA verification failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_signed_mldsa_verify", est_measure_elapsed(measure_start));
+    est_measure_cycles("cms_signed_total", est_measure_elapsed(measure_total));
 
     printf("CMS SignedData ML-DSA-44 self-test OK (cms_der=%u sig=%u)\r\n",
            (unsigned) cms_len,
@@ -631,26 +647,39 @@ static int cms_pqc_enveloped_data_self_test(void)
     uint8_t aes_gcm_params[32];
     size_t aes_gcm_params_len = 0;
     size_t i;
+    uint32_t measure_start;
+    uint32_t measure_total = est_measure_start();
     int ret;
 
     for (i = 0; i < sizeof(g_plaintext); i++) {
         g_plaintext[i] = (uint8_t) ('A' + (i % 26U));
     }
 
+    measure_start = est_measure_start();
     ret = pqc_mlkem512_keypair(g_kem_pk, g_kem_sk);
     if (ret != 0) {
         printf("ML-KEM-512 keypair failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_enveloped_mlkem_keypair", est_measure_elapsed(measure_start));
+    est_measure_size("mlkem_public_key", PQC_MLKEM512_PUBLICKEYBYTES);
+    est_measure_size("mlkem_secret_key", PQC_MLKEM512_SECRETKEYBYTES);
 
+    measure_start = est_measure_start();
     ret = pqc_mlkem512_enc(g_kem_ct, g_ss_originator, g_kem_pk);
     if (ret != 0) {
         printf("ML-KEM-512 encapsulation failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_enveloped_mlkem_encapsulate", est_measure_elapsed(measure_start));
+    est_measure_size("mlkem_ciphertext", PQC_MLKEM512_CIPHERTEXTBYTES);
+    est_measure_size("mlkem_shared_secret", PQC_MLKEM512_SHAREDSECRETBYTES);
 
+    measure_start = est_measure_start();
     cms_pqc_derive_aes_material(g_ss_originator, g_kem_ct);
+    est_measure_cycles("cms_enveloped_kdf_originator", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = cms_pqc_aes_gcm_encrypt(g_plaintext,
                                   sizeof(g_plaintext),
                                   g_encrypted,
@@ -660,13 +689,18 @@ static int cms_pqc_enveloped_data_self_test(void)
         printf("CMS AES-128-GCM encryption failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_aes_gcm_encrypt", est_measure_elapsed(measure_start));
+    est_measure_size("cms_enveloped_encrypted_content", encrypted_len);
 
+    measure_start = est_measure_start();
     ret = cms_pqc_write_aes_gcm_params(aes_gcm_params, sizeof(aes_gcm_params), &aes_gcm_params_len);
     if (ret != 0) {
         printf("CMS AES-128-GCM parameter encoding failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_aes_gcm_params", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = cms_pqc_build_enveloped_data(g_kem_ct,
                                        g_encrypted,
                                        encrypted_len,
@@ -679,7 +713,10 @@ static int cms_pqc_enveloped_data_self_test(void)
         printf("CMS EnvelopedData assembly failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_assemble", est_measure_elapsed(measure_start));
+    est_measure_size("cms_enveloped_der", cms_len);
 
+    measure_start = est_measure_start();
     ret = cms_find_tlv_after_oid(g_cms_buf,
                                  cms_len,
                                  OID_MLKEM512,
@@ -691,7 +728,9 @@ static int cms_pqc_enveloped_data_self_test(void)
         printf("CMS ML-KEM ciphertext parse failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_parse_ciphertext", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = cms_find_tlv_after_oid(g_cms_buf,
                                  cms_len,
                                  OID_AES128_GCM,
@@ -703,20 +742,26 @@ static int cms_pqc_enveloped_data_self_test(void)
         printf("CMS encrypted content parse failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_parse_encrypted_content", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = pqc_mlkem512_dec(g_ss_recipient, parsed_ct, g_kem_sk);
     if (ret != 0) {
         printf("ML-KEM-512 decapsulation failed: %d\r\n", ret);
         return -1;
     }
+    est_measure_cycles("cms_enveloped_mlkem_decapsulate", est_measure_elapsed(measure_start));
 
     if (memcmp(g_ss_originator, g_ss_recipient, sizeof(g_ss_originator)) != 0) {
         printf("ML-KEM-512 shared secret mismatch\r\n");
         return -1;
     }
 
+    measure_start = est_measure_start();
     cms_pqc_derive_aes_material(g_ss_recipient, parsed_ct);
+    est_measure_cycles("cms_enveloped_kdf_recipient", est_measure_elapsed(measure_start));
 
+    measure_start = est_measure_start();
     ret = cms_pqc_aes_gcm_decrypt(parsed_encrypted,
                                   parsed_encrypted_len,
                                   g_decrypted,
@@ -726,6 +771,7 @@ static int cms_pqc_enveloped_data_self_test(void)
         printf("CMS AES-128-GCM decryption failed\r\n");
         return -1;
     }
+    est_measure_cycles("cms_enveloped_aes_gcm_decrypt", est_measure_elapsed(measure_start));
 
     if (decrypted_len != sizeof(g_plaintext) ||
         memcmp(g_plaintext, g_decrypted, sizeof(g_plaintext)) != 0) {
@@ -743,6 +789,7 @@ static int cms_pqc_enveloped_data_self_test(void)
            (unsigned) cms_len,
            (unsigned) sizeof(g_plaintext),
            (unsigned) encrypted_len);
+    est_measure_cycles("cms_enveloped_total", est_measure_elapsed(measure_total));
 
     return 0;
 }

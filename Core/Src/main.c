@@ -36,6 +36,7 @@
 #include "bootstrap_credentials.h"
 #include "csr_gen.h"
 #include "cms_pqc.h"
+#include "est_measure.h"
 #include "tls_port.h"
 
 #include "mbedtls/base64.h"
@@ -440,6 +441,7 @@ static int print_raw_certificate_pem(const uint8_t *cert_der, size_t cert_der_le
 static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_b64_len)
 {
     int ret;
+    uint32_t measure_start;
     size_t compact_len = 0;
     size_t der_len = 0;
     size_t cert_off = 0;
@@ -462,6 +464,7 @@ static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_
         return -1;
     }
 
+    measure_start = est_measure_start();
     ret = mbedtls_base64_decode(g_der_buf,
                                 sizeof(g_der_buf),
                                 &der_len,
@@ -471,15 +474,20 @@ static int print_certificate_from_est_body(const uint8_t *body_b64, size_t body_
         print_mbedtls_error("mbedtls_base64_decode(EST body)", ret);
         return -1;
     }
+    est_measure_cycles("cms_response_base64_decode", est_measure_elapsed(measure_start));
+    est_measure_size("cms_der", der_len);
 
     printf("Decoded EST PKCS#7/CMS length: %u bytes\r\n", (unsigned) der_len);
     dump_hex_preview("decoded CMS body", g_der_buf, der_len, 96);
 
+    measure_start = est_measure_start();
     ret = find_first_der_certificate(g_der_buf, der_len, &cert_off, &cert_len);
     if (ret != 0) {
         printf("Failed to locate an embedded DER certificate inside CMS response\r\n");
         return -1;
     }
+    est_measure_cycles("cms_find_certificate", est_measure_elapsed(measure_start));
+    est_measure_size("issued_cert_der", cert_len);
 
     printf("Found DER certificate at offset %u, length %u bytes\r\n",
            (unsigned) cert_off,
@@ -574,6 +582,8 @@ int main(void)
     Error_Handler();
   }
 
+  est_measure_init();
+
   if (randombytes_stm32_init(&hrng, &hcryp1) != 0) {
       printf("randombytes_stm32_init failed\r\n");
       while (1);
@@ -588,10 +598,12 @@ int main(void)
   printf("TLS client certificate: %s\r\n", EST_USE_TLS_CLIENT_CERT ? "enabled" : "disabled");
 
 #if EST_USE_DYNAMIC_SERVER_CA
+  uint32_t measure_start_dynamic_ca;
   size_t server_ca_len = 0;
 
   printf("Acquiring TLS server certificate via UART proxy...\r\n");
 
+  measure_start_dynamic_ca = est_measure_start();
   ret = tls_port_fetch_server_cert(
       EST_HOST,
       EST_PORT,
@@ -603,6 +615,8 @@ int main(void)
       printf("TLS server certificate acquisition failed: %d\r\n", ret);
       while (1);
   }
+  est_measure_cycles("fetch_tls_server_cert", est_measure_elapsed(measure_start_dynamic_ca));
+  est_measure_size("tls_server_cert_pem", server_ca_len);
 
   printf("TLS server certificate acquired (%u bytes)\r\n", (unsigned) server_ca_len);
 #endif
@@ -613,6 +627,7 @@ int main(void)
 
    printf("\r\n=== STEP 1: GET cacerts ===\r\n");
 
+   uint32_t measure_start_step1 = est_measure_start();
    ret = est_client_get_cacerts(
        EST_HOST,
        EST_PORT,
@@ -625,6 +640,8 @@ int main(void)
    if (ret != 0) {
        printf("est_client_get_cacerts failed: %d\r\n", ret);
    } else {
+       est_measure_cycles("est_get_cacerts_total", est_measure_elapsed(measure_start_step1));
+       est_measure_size("cacerts_body", cacerts_len);
        printf("est_client_get_cacerts OK, body length = %u bytes\r\n",
               (unsigned)cacerts_len);
        dump_hex_preview("cacerts body", g_cacerts_buf, cacerts_len, 128);
@@ -640,13 +657,20 @@ int main(void)
    size_t csr_der_len = 0;
    size_t csr_b64_len = 0;
    size_t signature_len = 0;
+   uint32_t measure_start_step2 = est_measure_start();
+   uint32_t measure_start_op;
 
+   measure_start_op = est_measure_start();
    ret = crypto_sign_keypair(g_mldsa_pk, g_mldsa_sk);
    if (ret != 0) {
        printf("ML-DSA keypair failed: %d\r\n", ret);
        while (1);
    }
+   est_measure_cycles("mldsa_keypair", est_measure_elapsed(measure_start_op));
+   est_measure_size("mldsa_public_key", sizeof(g_mldsa_pk));
+   est_measure_size("mldsa_secret_key", sizeof(g_mldsa_sk));
 
+   measure_start_op = est_measure_start();
    ret = csr_build_certification_request_info(
        EST_DEVICE_COMMON_NAME,
        g_mldsa_pk, sizeof(g_mldsa_pk),
@@ -657,7 +681,10 @@ int main(void)
        printf("CSR CRI generation failed\r\n");
        while (1);
    }
+   est_measure_cycles("csr_cri_build", est_measure_elapsed(measure_start_op));
+   est_measure_size("csr_cri", csr_cri_len);
 
+   measure_start_op = est_measure_start();
    ret = crypto_sign_signature(
        g_mldsa_sig, &signature_len,
        g_csr_cri, csr_cri_len,
@@ -667,9 +694,12 @@ int main(void)
        printf("ML-DSA signing failed: %d\r\n", ret);
        while (1);
    }
+   est_measure_cycles("mldsa_sign_csr", est_measure_elapsed(measure_start_op));
+   est_measure_size("mldsa_signature", signature_len);
 
    printf("ML-DSA signature ready (%u bytes)\r\n", (unsigned)signature_len);
 
+   measure_start_op = est_measure_start();
    ret = crypto_sign_verify(
        g_mldsa_sig, signature_len,
        g_csr_cri, csr_cri_len,
@@ -679,9 +709,11 @@ int main(void)
        printf("ML-DSA local verification failed: %d\r\n", ret);
        while (1);
    }
+   est_measure_cycles("mldsa_verify_csr", est_measure_elapsed(measure_start_op));
 
    printf("ML-DSA local verification OK\r\n");
 
+   measure_start_op = est_measure_start();
    ret = csr_assemble(
        g_csr_cri, csr_cri_len,
        g_mldsa_sig, signature_len,
@@ -692,11 +724,14 @@ int main(void)
        printf("CSR assembly failed\r\n");
        while (1);
    }
+   est_measure_cycles("csr_assemble", est_measure_elapsed(measure_start_op));
+   est_measure_size("csr_der", csr_der_len);
 
    printf("CSR DER ready (%u bytes)\r\n", (unsigned)csr_der_len);
    dump_hex_preview("CSR DER", g_csr_der, csr_der_len, 128);
 
    /* Base64 encode CSR */
+   measure_start_op = est_measure_start();
    ret = mbedtls_base64_encode(
        g_csr_b64,
        sizeof(g_csr_b64),
@@ -708,6 +743,9 @@ int main(void)
        printf("Base64 encoding failed: %d\r\n", ret);
        while (1);
    }
+   est_measure_cycles("csr_base64_encode", est_measure_elapsed(measure_start_op));
+   est_measure_size("csr_base64", csr_b64_len);
+   est_measure_cycles("csr_generation_total", est_measure_elapsed(measure_start_step2));
 
    printf("CSR base64 ready (%u bytes)\r\n", (unsigned)csr_b64_len);
 
@@ -717,6 +755,7 @@ int main(void)
 
    printf("\r\n=== STEP 3: POST simpleenroll ===\r\n");
 
+   uint32_t measure_start_step3 = est_measure_start();
    ret = est_client_simpleenroll(
        EST_HOST,
        EST_PORT,
@@ -733,6 +772,8 @@ int main(void)
    if (ret != 0) {
        printf("est_client_simpleenroll failed: %d\r\n", ret);
    } else {
+       est_measure_cycles("est_simpleenroll_total", est_measure_elapsed(measure_start_step3));
+       est_measure_size("simpleenroll_body", enroll_len);
        printf("est_client_simpleenroll OK, PKCS#7 length = %u bytes\r\n",
               (unsigned)enroll_len);
        dump_hex_preview("simpleenroll body", g_enroll_buf, enroll_len, 128);
@@ -749,9 +790,12 @@ int main(void)
 
    printf("\r\n=== STEP 4: CMS PQC self-tests ===\r\n");
 
+   uint32_t measure_start_step4 = est_measure_start();
    ret = cms_pqc_self_test();
    if (ret != 0) {
        printf("CMS PQC self-tests failed: %d\r\n", ret);
+   } else {
+       est_measure_cycles("cms_pqc_self_tests_total", est_measure_elapsed(measure_start_step4));
    }
 
    printf("\r\nEST test finished\r\n");
